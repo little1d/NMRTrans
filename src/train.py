@@ -22,8 +22,8 @@ if parent_path not in sys.path:
 
 from config import TrainingConfig, prepare_tokenizer
 from callbacks import get_default_callbacks
-from models.data import NMRPeakDataset
-from models.model import NMR2SMILESModel
+from data import MergedDataset
+from model import NMR2SMILESModel
 
 
 # Environment setup
@@ -143,9 +143,9 @@ def peaks_collate_fn(batch, tokenizer, config):
 
 def build_dataloaders(config: TrainingConfig, tokenizer):
     """Build data loaders for training and validation."""
-    logger.info("Loading NMR peak datasets...")
-    train_dataset = NMRPeakDataset(config.TRAIN_FILE)
-    val_dataset = NMRPeakDataset(config.VAL_FILE)
+    logger.info("Loading datasets...")
+    train_dataset = MergedDataset(config.TRAIN_FILE)
+    val_dataset = MergedDataset(config.VAL_FILE)
 
     logger.info(f"训练集样本数: {len(train_dataset)}")
     logger.info(f"验证集样本数: {len(val_dataset)}")

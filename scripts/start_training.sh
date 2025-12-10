@@ -17,4 +17,4 @@ nvcc -V
 cd "$(dirname "$0")/.."
 
 # Run the training
-python main.py
+python src/train.py
