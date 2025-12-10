@@ -27,7 +27,19 @@ class MergedDataset(Dataset):
                 open_func = open
 
             with open_func(file_path, "rb") as f:
-                self.data = pickle.load(f)
+                # 读取所有pickle对象
+                while True:
+                    try:
+                        batch = pickle.load(f)
+                        if isinstance(batch, list):
+                            self.data.extend(batch)
+                        else:
+                            self.data.append(batch)
+                    except EOFError:
+                        break
+                    except Exception as e:
+                        logger.error(f"加载pickle对象时出错: {str(e)}")
+                        break
 
             self.total_samples = len(self.data)
             load_time = time.time() - start_time
