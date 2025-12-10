@@ -1,6 +1,5 @@
 import logging
 import os
-from typing import Dict, List, Union, Tuple, Optional
 
 
 def _load_local_config():
@@ -29,10 +28,6 @@ _DEFAULT_MERGED_DATA_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/
 _DEFAULT_VOCAB_PATH = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/vocab.json"
 _DEFAULT_SAVE_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/checkpoints_ar"
 
-# Default spectrum and feature configuration
-_DEFAULT_SPECTRUM_TYPES = ["h_nmr_peaks", "c_nmr_peaks"]
-_DEFAULT_MAX_PEAKS = 60
-
 # Default SwanLab configuration
 _DEFAULT_USE_SWANLAB = True
 _DEFAULT_SWANLAB_PROJECT = "spectra2smiles-ar"
@@ -40,7 +35,8 @@ _DEFAULT_SWANLAB_RUN_NAME = "t5-ar-baseline"
 
 
 class TrainingConfig:
-    """Configuration for Spectra2Smiles-AR training with T5."""
+    """Configuration for Spectra2Smiles-AR training with T5.
+    """
     
     # ========== Path Configuration ==========
     MERGED_DATA_DIR = _get_config("MERGED_DATA_DIR", _DEFAULT_MERGED_DATA_DIR)
@@ -52,23 +48,20 @@ class TrainingConfig:
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
     
     # ========== Data Configuration ==========
-    SPECTRUM_TYPES = _get_config("SPECTRUM_TYPES", _DEFAULT_SPECTRUM_TYPES)
-    MAX_PEAKS = _get_config("MAX_PEAKS", _DEFAULT_MAX_PEAKS)
+    # AR project only uses NMR peaks (discrete)
+    MAX_PEAKS = _get_config("MAX_PEAKS", 60)  # Maximum number of peaks per spectrum
     MAX_SMILES_LENGTH = 80
     MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS = MAX_SMILES_LENGTH + 2  # +2 for <bos> and <eos>
     
-    # ========== Model Architecture ==========
-    # T5 configuration
+    # ========== T5 Model Configuration ==========
     T5_MODEL_NAME = _get_config("T5_MODEL_NAME", "t5-small")  # t5-small, t5-base, t5-large
+    FREEZE_T5_DECODER = _get_config("FREEZE_T5_DECODER", False)
     
-    # Peak encoder configuration
+    # ========== Peak Encoder Configuration ==========
     PEAK_ENCODER_D_MODEL = _get_config("PEAK_ENCODER_D_MODEL", 512)
     PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 2)
     PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 4)
     PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 1024)
-    
-    # Whether to freeze T5 decoder initially
-    FREEZE_T5_DECODER = _get_config("FREEZE_T5_DECODER", False)
     
     # ========== Training Hyperparameters ==========
     BATCH_SIZE = _get_config("BATCH_SIZE", 32)
