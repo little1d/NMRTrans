@@ -7,12 +7,12 @@ import os
 import sys
 import time
 import warnings
+from datetime import datetime
 from functools import partial
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 
 # Add parent directory to path for imports
@@ -21,7 +21,7 @@ if parent_path not in sys.path:
     sys.path.insert(0, parent_path)
 
 from config import TrainingConfig, prepare_tokenizer
-from callbacks import EpochResultPrinter, ValidationResultPrinter
+from callbacks import get_default_callbacks
 from models.data import NMRPeakDataset
 from models.model import NMR2SMILESModel
 
@@ -34,15 +34,23 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 warnings.filterwarnings("ignore")
 
+# Create log directory if it doesn't exist
+os.makedirs("logs", exist_ok=True)
+
+# Generate timestamp for log filename
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f"logs/spectra2smiles_ar_training_{timestamp}.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - [Rank %(process)d] - %(message)s",
     handlers=[
-        logging.FileHandler("spectra2smiles_ar_training.log"),
+        logging.FileHandler(log_filename),
         logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Log file: {log_filename}")
 
 
 def pad_peak_sequences(peak_sequences, max_peaks):
@@ -222,24 +230,10 @@ def main():
     logger.info(f"Peak Encoder d_model: {config.PEAK_ENCODER_D_MODEL}")
     logger.info(f"Peak Encoder layers: {config.PEAK_ENCODER_N_LAYERS}")
     logger.info(f"Peak Encoder heads: {config.PEAK_ENCODER_N_HEADS}")
-    logger.info(f"Freeze T5 Decoder: {config.FREEZE_T5_DECODER}")
     logger.info(f"{'=' * 50}\n")
 
-    # Checkpoint callback
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=config.SAVE_DIR,
-        filename="ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
-        monitor="val_seq_acc",
-        save_top_k=3,
-        mode="max",
-        save_weights_only=False,
-        every_n_epochs=1,
-        save_on_train_epoch_end=True,
-    )
-
-    epoch_printer = EpochResultPrinter()
-    validation_printer = ValidationResultPrinter()
-    callbacks = [checkpoint_callback, epoch_printer, validation_printer]
+    # Get default callbacks (including checkpoint, printers, and SwanLab logger)
+    callbacks = get_default_callbacks(config, config.SAVE_DIR)
 
     pl_logger = True
     if getattr(config, "USE_SWANLAB", False):
