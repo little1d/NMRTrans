@@ -1,5 +1,11 @@
+import pickle
+import lz4.frame
+from torch.utils.data import Dataset
+
+
 class NMRPeakDataset(Dataset):
     """处理lz4压缩的pkl格式NMR数据集"""
+    
     def __init__(self, data_path: str):
         """
         Args:
@@ -9,10 +15,14 @@ class NMRPeakDataset(Dataset):
         self.data = self._load_data()
         
         # 检查数据集中是否包含H-NMR和C-NMR
-        self.has_h_nmr = all('h_nmr_peaks' in sample and sample['h_nmr_peaks'] is not None 
-                            for sample in self.data if sample)
-        self.has_c_nmr = all('c_nmr_peaks' in sample and sample['c_nmr_peaks'] is not None 
-                            for sample in self.data if sample)
+        self.has_h_nmr = all(
+            'h_nmr_peaks' in sample and sample['h_nmr_peaks'] is not None 
+            for sample in self.data if sample
+        )
+        self.has_c_nmr = all(
+            'c_nmr_peaks' in sample and sample['c_nmr_peaks'] is not None 
+            for sample in self.data if sample
+        )
         
         if not (self.has_h_nmr or self.has_c_nmr):
             raise ValueError("数据集必须包含h_nmr_peaks或c_nmr_peaks")
@@ -30,9 +40,9 @@ class NMRPeakDataset(Dataset):
         
         # 确保返回的样本格式正确
         return {
-            "smiles": sample["smiles"],  # 原始ChemBERTa分词后的token IDs
+            "smiles": sample.get("smiles"),  # 原始token IDs（如果有）
             "original_smiles": sample["original_smiles"],  # 原始SMILES字符串
-            "h_nmr_peaks": sample["h_nmr_peaks"] if self.has_h_nmr else None,
-            "c_nmr_peaks": sample["c_nmr_peaks"] if self.has_c_nmr else None,
-            "molecular_formula": sample["molecular_formula"] if "molecular_formula" in sample else None
+            "h_nmr_peaks": sample.get("h_nmr_peaks") if self.has_h_nmr else None,
+            "c_nmr_peaks": sample.get("c_nmr_peaks") if self.has_c_nmr else None,
+            "molecular_formula": sample.get("molecular_formula", None)
         }
