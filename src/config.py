@@ -92,7 +92,7 @@ class TrainingConfig:
     PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 1024)
     
     # ========== Training Hyperparameters ==========
-    BATCH_SIZE = _get_config("BATCH_SIZE", 1280)
+    BATCH_SIZE = _get_config("BATCH_SIZE", 1024)
     TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
     LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
     EPOCHS = _get_config("EPOCHS", 6000)

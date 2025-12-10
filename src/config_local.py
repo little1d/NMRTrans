@@ -16,3 +16,4 @@ DEVICES = 4
 
 # T5 Model - use LOCAL path
 T5_MODEL_NAME = "/mnt/shared-storage-user/yangzhuo/main/models/google-t5/t5-small"
+BATCH_SIZE = 1024

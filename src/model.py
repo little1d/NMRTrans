@@ -155,11 +155,16 @@ class NMR2SMILESModel(pl.LightningModule):
             local_files_only=True  # Use local model files only, don't access network
         )
         
+        # IMPORTANT: Set T5 to training mode
+        self.t5.train()
+        
         # Optionally freeze T5 decoder
         if config.FREEZE_T5_DECODER:
             logger.info("Freezing T5 decoder parameters")
             for param in self.t5.decoder.parameters():
                 param.requires_grad = False
+            # Even if frozen, keep in train mode for other modules
+            self.t5.train()
         
         # For logging
         self.validation_outputs = []
@@ -198,12 +203,15 @@ class NMR2SMILESModel(pl.LightningModule):
         # 构造 encoder_outputs（跳过 T5 encoder）
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
 
+        # Create encoder attention mask (all ones since we only have 1 token)
+        batch_size = encoder_hidden.size(0)
+        encoder_attention_mask = torch.ones(batch_size, 1, dtype=torch.long, device=encoder_hidden.device)
+
         # 送入 T5 decoder
         outputs = self.t5(
             encoder_outputs=encoder_outputs,
+            attention_mask=encoder_attention_mask,  # attention mask for encoder outputs
             labels=smiles_ids,
-            attention_mask=None,              # we don't need it for encoder
-            decoder_attention_mask=attention_mask,
         )
         return outputs
     
@@ -212,6 +220,12 @@ class NMR2SMILESModel(pl.LightningModule):
         smiles_ids = batch["smiles"].long()
         c_peaks = batch.get("c_nmr_peaks")
         h_peaks = batch.get("h_nmr_peaks")
+        
+        # Check for NaN in input data
+        if c_peaks is not None and torch.isnan(c_peaks).any():
+            logger.warning(f"NaN detected in c_peaks at batch {batch_idx}")
+        if h_peaks is not None and torch.isnan(h_peaks).any():
+            logger.warning(f"NaN detected in h_peaks at batch {batch_idx}")
         
         # T5 expects labels with -100 for positions to ignore
         labels = smiles_ids.clone()
@@ -225,6 +239,16 @@ class NMR2SMILESModel(pl.LightningModule):
         )
         
         loss = outputs.loss
+        
+        # Check for NaN loss
+        if torch.isnan(loss):
+            logger.error(f"NaN loss detected at batch {batch_idx}")
+            logger.error(f"C peaks shape: {c_peaks.shape if c_peaks is not None else None}")
+            logger.error(f"H peaks shape: {h_peaks.shape if h_peaks is not None else None}")
+            logger.error(f"SMILES ids shape: {smiles_ids.shape}")
+            logger.error(f"Labels shape: {labels.shape}")
+            # Return a zero loss to continue training
+            return torch.tensor(0.0, requires_grad=True, device=loss.device)
         
         # Compute accuracy
         with torch.no_grad():
