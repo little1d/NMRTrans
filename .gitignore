@@ -1,0 +1,11 @@
+playground/
+checkpoints/
+cache/
+/__pycache__
+*.pyc
+
+# Local configuration files (user-specific)
+
+# Logs
+*.log
+swanlog/
