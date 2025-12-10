@@ -5,6 +5,7 @@ cache/
 *.pyc
 
 # Local configuration files (user-specific)
+config_local.py
 
 # Logs
 *.log
