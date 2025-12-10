@@ -5,8 +5,9 @@ cache/
 *.pyc
 
 # Local configuration files (user-specific)
-config_local.py
+src/config_local.py
 
 # Logs
 *.log
 swanlog/
+/.vscode

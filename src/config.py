@@ -5,14 +5,42 @@ import os
 def _load_local_config():
     """Load local configuration from config_local.py if it exists."""
     try:
+        # Try relative import first
         from . import config_local
         return config_local
-    except ImportError:
-        return None
+    except (ImportError, ValueError):
+        # If relative import fails, try absolute import
+        try:
+            import config_local
+            return config_local
+        except ImportError:
+            # If that also fails, try importing from current directory
+            try:
+                import sys
+                import os
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                if current_dir not in sys.path:
+                    sys.path.insert(0, current_dir)
+                import config_local
+                return config_local
+            except ImportError:
+                return None
 
 
 # Load local config if available
 _local_config = _load_local_config()
+
+# Debug: check if local config is loaded
+if _local_config:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Successfully loaded config_local.py")
+    if hasattr(_local_config, 'T5_MODEL_NAME'):
+        logger.info(f"T5_MODEL_NAME from config_local: {_local_config.T5_MODEL_NAME}")
+else:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning("config_local.py not found, using default configuration")
 
 
 # Helper function to get config value from local config or default
@@ -64,12 +92,12 @@ class TrainingConfig:
     PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 1024)
     
     # ========== Training Hyperparameters ==========
-    BATCH_SIZE = _get_config("BATCH_SIZE", 32)
+    BATCH_SIZE = _get_config("BATCH_SIZE", 1280)
     TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
-    LEARNING_RATE = _get_config("LEARNING_RATE", 5e-5)
-    EPOCHS = _get_config("EPOCHS", 100)
+    LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
+    EPOCHS = _get_config("EPOCHS", 6000)
     GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
-    ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 1)
+    ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
     
     # Data loading
     NUM_DATA_WORKERS = _get_config("NUM_DATA_WORKERS", 8)
@@ -77,7 +105,7 @@ class TrainingConfig:
     
     # Validation
     LIMIT_VAL_BATCHES = _get_config("LIMIT_VAL_BATCHES", 1.0)
-    CHECK_VAL_EVERY_N_EPOCH = _get_config("CHECK_VAL_EVERY_N_EPOCH", 1)
+    CHECK_VAL_EVERY_N_EPOCH = _get_config("CHECK_VAL_EVERY_N_EPOCH", 20)
     
     # Logging
     TRAIN_EXAMPLE_LIMIT = _get_config("TRAIN_EXAMPLE_LIMIT", 3)

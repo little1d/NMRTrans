@@ -29,7 +29,7 @@ from model import NMR2SMILESModel
 # Environment setup
 os.environ["TF_DISABLE_MMAP"] = "1"
 os.environ["TF_DISABLE_CUBLAS_TENSOR_OP_MATH"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"  # Need to download T5
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  # Use local models only
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 warnings.filterwarnings("ignore")

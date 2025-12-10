@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
-from transformers import T5ForConditionalGeneration, BaseModelOutput
+from transformers import T5ForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +149,11 @@ class NMR2SMILESModel(pl.LightningModule):
         self.fusion = FusionLayer(d_model=d_model)
 
         # T5 用于 decoder-only（但依然 load 整个模型）
-        logger.info(f"Loading T5 model: {config.T5_MODEL_NAME}")
-        self.t5 = T5ForConditionalGeneration.from_pretrained(config.T5_MODEL_NAME)
+        logger.info(f"Loading T5 model from: {config.T5_MODEL_NAME}")
+        self.t5 = T5ForConditionalGeneration.from_pretrained(
+            config.T5_MODEL_NAME,
+            local_files_only=True  # Use local model files only, don't access network
+        )
         
         # Optionally freeze T5 decoder
         if config.FREEZE_T5_DECODER:
