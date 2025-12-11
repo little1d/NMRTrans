@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Any, Dict
+import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
@@ -209,6 +210,7 @@ def get_default_callbacks(config, save_dir: str):
     callbacks = [
         EpochResultPrinter(),
         ValidationResultPrinter(),
+        GradientMonitor(log_every_n_steps=50),
         BestModelCheckpoint(
             dirpath=save_dir,
             monitor="val_seq_acc",
@@ -225,10 +227,55 @@ def get_default_callbacks(config, save_dir: str):
     return callbacks
 
 
+class GradientMonitor(Callback):
+    """Monitor gradients and detect NaN/Inf issues."""
+    
+    def __init__(self, log_every_n_steps: int = 50):
+        super().__init__()
+        self.log_every_n_steps = log_every_n_steps
+    
+    def on_after_backward(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Check gradients after backward pass."""
+        if trainer.global_step % self.log_every_n_steps != 0:
+            return
+        
+        if trainer.global_rank != 0:
+            return
+        
+        # Check for NaN/Inf gradients
+        has_nan = False
+        has_inf = False
+        max_grad = 0.0
+        
+        for name, param in pl_module.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any():
+                    has_nan = True
+                    logger.warning(f"NaN gradient detected in {name}")
+                if torch.isinf(param.grad).any():
+                    has_inf = True
+                    logger.warning(f"Inf gradient detected in {name}")
+                
+                grad_norm = param.grad.norm().item()
+                max_grad = max(max_grad, grad_norm)
+        
+        if has_nan or has_inf:
+            logger.error(f"Gradient issues at step {trainer.global_step}: NaN={has_nan}, Inf={has_inf}")
+        
+        # Log gradient statistics
+        if trainer.logger:
+            trainer.logger.log_metrics({
+                "grad_max_norm": max_grad,
+                "grad_has_nan": float(has_nan),
+                "grad_has_inf": float(has_inf),
+            }, step=trainer.global_step)
+
+
 __all__ = [
     "EpochResultPrinter",
     "ValidationResultPrinter", 
     "BestModelCheckpoint",
     "SwanLabImageLogger",
+    "GradientMonitor",
     "get_default_callbacks",
 ]

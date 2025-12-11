@@ -1,7 +1,7 @@
 #!/bin/bash
 
 rjob submit \
-    --name=len-head-only-1208-ct-r4 \
+    --name=1211-spec2smi-t5-small-r6 \
     --gpu=8 \
     --memory=1200000 \
     --cpu=128 \
@@ -13,4 +13,4 @@ rjob submit \
     --host-network=true \
     --custom-resources brainpp.cn/fuse=1 \
     -e DISTRIBUTED_JOB=true \
-    -- bash -exc /mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/scripts/start_training.sh
+    -- bash -exc "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/scripts/start_training.sh"

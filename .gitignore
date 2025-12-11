@@ -1,13 +1,25 @@
+# Directories to ignore
 playground/
 checkpoints/
 cache/
-/__pycache__
+__pycache__/
 *.pyc
+.vscode/
+swanlog/
+logs/
 
 # Local configuration files (user-specific)
 src/config_local.py
+config_local.py
 
 # Logs
 *.log
-swanlog/
-/.vscode
+
+# Python cache
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/

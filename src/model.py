@@ -51,18 +51,35 @@ class PeakEncoder(nn.Module):
         else:
             raise ValueError(f"Expected peaks to have 2 or 3 dimensions, got {peaks.dim()}")
 
+        # Check for NaN/Inf in input
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            logger.error("NaN or Inf detected in peaks input!")
+            # Replace NaN/Inf with zeros
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
         # input projection
         x = self.input_proj(x)    # (B, L, d_model)
 
         # transformer encoding
         x = self.transformer(x)   # (B, L, d_model)
 
+        # Check for NaN/Inf after transformer
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            logger.error("NaN or Inf detected after transformer encoding!")
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
         # mean pooling (avoid padding=0)
-        mask = (peaks.squeeze(-1) != 0).unsqueeze(-1)  # padding=0
+        mask = (peaks.squeeze(-1).abs() > 1e-8).unsqueeze(-1)  # more robust than !=0
         x_sum = (x * mask).sum(dim=1)
-        x_cnt = mask.sum(dim=1).clamp(min=1)
+        x_cnt = mask.sum(dim=1).clamp(min=1e-8)  # Avoid exact zero
 
         x_mean = x_sum / x_cnt
+        
+        # Final check
+        if torch.isnan(x_mean).any() or torch.isinf(x_mean).any():
+            logger.error("NaN or Inf detected in peak encoder output!")
+            x_mean = torch.nan_to_num(x_mean, nan=0.0, posinf=0.0, neginf=0.0)
+        
         return x_mean   # (B, d_model)
 
 
@@ -241,14 +258,25 @@ class NMR2SMILESModel(pl.LightningModule):
         loss = outputs.loss
         
         # Check for NaN loss
-        if torch.isnan(loss):
-            logger.error(f"NaN loss detected at batch {batch_idx}")
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.error(f"NaN/Inf loss detected at batch {batch_idx}")
             logger.error(f"C peaks shape: {c_peaks.shape if c_peaks is not None else None}")
             logger.error(f"H peaks shape: {h_peaks.shape if h_peaks is not None else None}")
             logger.error(f"SMILES ids shape: {smiles_ids.shape}")
             logger.error(f"Labels shape: {labels.shape}")
-            # Return a zero loss to continue training
-            return torch.tensor(0.0, requires_grad=True, device=loss.device)
+            
+            # Check data range
+            if c_peaks is not None:
+                logger.error(f"C peaks range: [{c_peaks.min():.4f}, {c_peaks.max():.4f}]")
+            if h_peaks is not None:
+                logger.error(f"H peaks range: [{h_peaks.min():.4f}, {h_peaks.max():.4f}]")
+            
+            # Check if logits have NaN
+            if torch.isnan(outputs.logits).any():
+                logger.error("NaN detected in model logits!")
+            
+            # Skip this batch
+            return None
         
         # Compute accuracy
         with torch.no_grad():
@@ -264,20 +292,25 @@ class NMR2SMILESModel(pl.LightningModule):
             seq_correct = ((pred_tokens == smiles_ids) | ~valid_mask).all(dim=1)
             seq_acc = seq_correct.float().mean()
         
-        # Log metrics
-        self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("train_token_acc", token_acc, prog_bar=True, sync_dist=True)
-        self.log("train_seq_acc", seq_acc, prog_bar=True, sync_dist=True)
+        # Log metrics (添加 logger=True 以同步到 SwanLab)
+        self.log("train_loss", loss, prog_bar=True, sync_dist=True, logger=True)
+        self.log("train_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
+        self.log("train_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
         
         # Log learning rate
         if self.trainer and self.trainer.optimizers:
             current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-            self.log("lr", current_lr, prog_bar=False)
+            self.log("lr", current_lr, prog_bar=False, logger=True)
         
         return loss
     
     def validation_step(self, batch, batch_idx):
         """Validation step with autoregressive generation."""
+        if batch_idx == 0 and self.global_rank == 0:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Starting validation at epoch {self.current_epoch}")
+            logger.info(f"{'='*80}")
+        
         smiles_ids = batch["smiles"].long()
         c_peaks = batch.get("c_nmr_peaks")
         h_peaks = batch.get("h_nmr_peaks")
@@ -306,25 +339,29 @@ class NMR2SMILESModel(pl.LightningModule):
             seq_correct = ((pred_tokens == smiles_ids) | ~valid_mask).all(dim=1)
             seq_acc = seq_correct.float().mean()
         
-        # Log metrics
-        self.log("val_token_acc", token_acc, prog_bar=True, sync_dist=True)
-        self.log("val_seq_acc", seq_acc, prog_bar=True, sync_dist=True)
+        # Log metrics (添加 logger=True 以同步到 SwanLab)
+        self.log("val_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
+        self.log("val_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
         
         # Generate and log examples
         if batch_idx % 10 == 0 and self.global_rank == 0:
-            generated = self.generate(c_peaks[:1], h_peaks[:1] if h_peaks is not None else None)
-            generated_smiles = self.tokens_to_smiles(generated[0])
-            original_smiles = original_smiles_list[0]
-            
-            logger.info(f"Original:  {original_smiles}")
-            logger.info(f"Generated: {generated_smiles}")
-            
-            self.validation_outputs.append({
-                "original": original_smiles,
-                "predicted_original": generated_smiles,
-                "val_token_acc": token_acc.item(),
-                "val_seq_acc": seq_acc.item(),
-            })
+            try:
+                generated = self.generate(c_peaks[:1], h_peaks[:1] if h_peaks is not None else None)
+                generated_smiles = self.tokens_to_smiles(generated[0])
+                original_smiles = original_smiles_list[0]
+                
+                logger.info(f"\n[Validation Example {batch_idx}]")
+                logger.info(f"Original:  {original_smiles}")
+                logger.info(f"Generated: {generated_smiles}")
+                
+                self.validation_outputs.append({
+                    "original": original_smiles,
+                    "predicted_original": generated_smiles,
+                    "val_token_acc": token_acc.item(),
+                    "val_seq_acc": seq_acc.item(),
+                })
+            except Exception as e:
+                logger.warning(f"Failed to generate validation example: {e}")
         
         return {"val_token_acc": token_acc, "val_seq_acc": seq_acc}
     
