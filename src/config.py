@@ -87,9 +87,10 @@ class TrainingConfig:
     
     # ========== Peak Encoder Configuration ==========
     PEAK_ENCODER_D_MODEL = _get_config("PEAK_ENCODER_D_MODEL", 512)
-    PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 2)
-    PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 4)
-    PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 1024)
+    PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 6)  # 增加到6层
+    PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 8)  # 增加注意力头
+    PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 2048)  # 增加FFN维度
+    PEAK_ENCODER_DROPOUT = _get_config("PEAK_ENCODER_DROPOUT", 0.1)  # 添加 dropout
     
     # ========== Training Hyperparameters ==========
     BATCH_SIZE = _get_config("BATCH_SIZE", 1024)

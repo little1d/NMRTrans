@@ -1,7 +1,7 @@
 #!/bin/bash
 
 rjob submit \
-    --name=1211-spec2smi-t5-small-r6 \
+    --name=1212-spec2smi-t5-small-baseline-r1 \
     --gpu=8 \
     --memory=1200000 \
     --cpu=128 \

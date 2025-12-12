@@ -18,25 +18,40 @@ logger = logging.getLogger(__name__)
 
 class PeakEncoder(nn.Module):
     """
-    输入: (B, L) 的 ppm list → 输出: (B, d_model) 的全局语义向量
+    输入: (B, L) 的 ppm list → 输出: (B, L, d_model) 的峰序列编码
     """
-    def __init__(self, d_model=512, n_layers=2, n_heads=4, ff_dim=1024):
+    def __init__(self, d_model=512, n_layers=6, n_heads=8, ff_dim=2048, dropout=0.1, max_peaks=60):
         super().__init__()
         
+        self.d_model = d_model
+        self.max_peaks = max_peaks
+        
+        # 1. 峰值投影
         self.input_proj = nn.Linear(1, d_model)
-
+        
+        # 2. 峰顺序嵌入（learnable positional embedding）
+        self.peak_order_embedding = nn.Embedding(max_peaks, d_model)
+        
+        # 3. 输入 LayerNorm
+        self.input_norm = nn.LayerNorm(d_model)
+        
+        # 4. Transformer 编码器（带 dropout）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             dim_feedforward=ff_dim,
             nhead=n_heads,
+            dropout=dropout,
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # 5. 输出 LayerNorm
+        self.output_norm = nn.LayerNorm(d_model)
     
     def forward(self, peaks):
         """
         peaks: list of lists → 已转换成 padded tensor (B, L) or (B, L, 1)
-        returns: (B, d_model)
+        returns: (B, L, d_model) - 保留序列维度
         """
         if peaks is None:
             return None
@@ -51,36 +66,37 @@ class PeakEncoder(nn.Module):
         else:
             raise ValueError(f"Expected peaks to have 2 or 3 dimensions, got {peaks.dim()}")
 
+        batch_size, num_peaks, _ = x.shape
+        
         # Check for NaN/Inf in input
         if torch.isnan(x).any() or torch.isinf(x).any():
-            logger.error("NaN or Inf detected in peaks input!")
-            # Replace NaN/Inf with zeros
+            logger.warning("NaN or Inf detected in peaks input!")
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # input projection
+        # 1. 峰值投影
         x = self.input_proj(x)    # (B, L, d_model)
 
-        # transformer encoding
+        # 2. 添加峰顺序嵌入（类似位置编码）
+        peak_indices = torch.arange(num_peaks, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        peak_indices = torch.clamp(peak_indices, max=self.max_peaks - 1)  # 防止超出范围
+        order_emb = self.peak_order_embedding(peak_indices)  # (B, L, d_model)
+        x = x + order_emb
+        
+        # 3. 输入归一化
+        x = self.input_norm(x)
+
+        # 4. Transformer 编码（带 dropout）
         x = self.transformer(x)   # (B, L, d_model)
 
         # Check for NaN/Inf after transformer
         if torch.isnan(x).any() or torch.isinf(x).any():
-            logger.error("NaN or Inf detected after transformer encoding!")
+            logger.warning("NaN or Inf detected after transformer encoding!")
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # mean pooling (avoid padding=0)
-        mask = (peaks.squeeze(-1).abs() > 1e-8).unsqueeze(-1)  # more robust than !=0
-        x_sum = (x * mask).sum(dim=1)
-        x_cnt = mask.sum(dim=1).clamp(min=1e-8)  # Avoid exact zero
-
-        x_mean = x_sum / x_cnt
+        # 5. 输出归一化
+        x = self.output_norm(x)
         
-        # Final check
-        if torch.isnan(x_mean).any() or torch.isinf(x_mean).any():
-            logger.error("NaN or Inf detected in peak encoder output!")
-            x_mean = torch.nan_to_num(x_mean, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        return x_mean   # (B, d_model)
+        return x   # (B, L, d_model)
 
 
 # ===========================================================
@@ -104,6 +120,8 @@ class FusionLayer(nn.Module):
 
     def forward(self, z_c, z_h, z_guidance=None):
         # 主模态 C/H 融合
+        # z_c: (B, L_c, d_model)
+        # z_h: (B, L_h, d_model)
         nmr_list = []
 
         if z_c is not None:
@@ -114,18 +132,19 @@ class FusionLayer(nn.Module):
         if len(nmr_list) == 0:
             raise ValueError("No NMR modality provided! Need at least C or H.")
 
-        # 融合主模态
-        z_nmr = torch.stack(nmr_list, dim=0).mean(dim=0)   # (B, d_model)
+        # ✅ 在序列维度拼接，保留所有峰点信息
+        # 而不是压缩成一个向量
+        z_nmr = torch.cat(nmr_list, dim=1)   # (B, L_c + L_h, d_model)
 
         # 指导模态（formula/MS等）作为 bias
         if z_guidance is not None:
-            z_all = z_nmr + z_guidance
+            # 如果有 guidance，在序列维度拼接
+            z_all = torch.cat([z_nmr, z_guidance], dim=1)
         else:
             z_all = z_nmr
 
-        # 注意 T5 encoder_outputs 需要 (B, L, d)
-        # 我们这里 L=1
-        return z_all.unsqueeze(1)   # (B, 1, d_model)
+        # 返回完整的序列，让 T5 decoder 可以 attend 到所有峰点
+        return z_all   # (B, L_total, d_model)
 
 
 # ===========================================================
@@ -148,18 +167,22 @@ class NMR2SMILESModel(pl.LightningModule):
         
         d_model = config.PEAK_ENCODER_D_MODEL
         
-        # 主模态 encoder
+        # 主模态 encoder（添加 dropout 和 max_peaks 参数）
         self.c_encoder = PeakEncoder(
             d_model=d_model,
             n_layers=config.PEAK_ENCODER_N_LAYERS,
             n_heads=config.PEAK_ENCODER_N_HEADS,
-            ff_dim=config.PEAK_ENCODER_FF_DIM
+            ff_dim=config.PEAK_ENCODER_FF_DIM,
+            dropout=config.PEAK_ENCODER_DROPOUT,
+            max_peaks=config.MAX_PEAKS
         )
         self.h_encoder = PeakEncoder(
             d_model=d_model,
             n_layers=config.PEAK_ENCODER_N_LAYERS,
             n_heads=config.PEAK_ENCODER_N_HEADS,
-            ff_dim=config.PEAK_ENCODER_FF_DIM
+            ff_dim=config.PEAK_ENCODER_FF_DIM,
+            dropout=config.PEAK_ENCODER_DROPOUT,
+            max_peaks=config.MAX_PEAKS
         )
 
         # Fusion
@@ -220,9 +243,12 @@ class NMR2SMILESModel(pl.LightningModule):
         # 构造 encoder_outputs（跳过 T5 encoder）
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
 
-        # Create encoder attention mask (all ones since we only have 1 token)
-        batch_size = encoder_hidden.size(0)
-        encoder_attention_mask = torch.ones(batch_size, 1, dtype=torch.long, device=encoder_hidden.device)
+        # Create encoder attention mask for the peak sequence
+        # encoder_hidden: (B, L, d_model) where L = num_c_peaks + num_h_peaks
+        batch_size, seq_len, _ = encoder_hidden.shape
+        
+        # Create mask: all ones since all peaks are valid (no padding in peaks)
+        encoder_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
 
         # 送入 T5 decoder
         outputs = self.t5(
@@ -374,12 +400,17 @@ class NMR2SMILESModel(pl.LightningModule):
         with torch.no_grad():
             z_c = self.c_encoder(c_peaks) if c_peaks is not None else None
             z_h = self.h_encoder(h_peaks) if h_peaks is not None else None
-            encoder_hidden = self.fusion(z_c, z_h, None)
+            encoder_hidden = self.fusion(z_c, z_h, None)  # (B, L, d_model)
             encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
+            
+            # Create attention mask for the encoder sequence
+            batch_size, seq_len, _ = encoder_hidden.shape
+            attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
             
             # Use T5 generate method
             generated_ids = self.t5.generate(
                 encoder_outputs=encoder_outputs,
+                attention_mask=attention_mask,
                 max_length=max_length,
                 num_beams=1,
                 do_sample=False,
