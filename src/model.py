@@ -176,7 +176,6 @@ class NMR2SMILESModel(pl.LightningModule):
     主架构：
     - 不使用 T5 encoder
     - 自己实现 H/C encoder
-    - guidance 接口保留但不实现
     - 最终输出喂给 T5 decoder
     """
     def __init__(self, config, tokenizer):
@@ -187,23 +186,61 @@ class NMR2SMILESModel(pl.LightningModule):
         
         d_model = config.PEAK_ENCODER_D_MODEL
         
-        # 主模态 encoder（添加 dropout 和 max_peaks 参数）
-        self.c_encoder = PeakEncoder(
-            d_model=d_model,
-            n_layers=config.PEAK_ENCODER_N_LAYERS,
-            n_heads=config.PEAK_ENCODER_N_HEADS,
-            ff_dim=config.PEAK_ENCODER_FF_DIM,
-            dropout=config.PEAK_ENCODER_DROPOUT,
-            max_peaks=config.MAX_PEAKS
-        )
-        self.h_encoder = PeakEncoder(
-            d_model=d_model,
-            n_layers=config.PEAK_ENCODER_N_LAYERS,
-            n_heads=config.PEAK_ENCODER_N_HEADS,
-            ff_dim=config.PEAK_ENCODER_FF_DIM,
-            dropout=config.PEAK_ENCODER_DROPOUT,
-            max_peaks=config.MAX_PEAKS
-        )
+        # 消融实验：根据配置决定是否初始化 C/H encoder
+        use_c_nmr = getattr(config, "USE_C_NMR", True)
+        use_h_nmr = getattr(config, "USE_H_NMR", True)
+        use_formula = getattr(config, "USE_FORMULA_GUIDANCE", True)
+        
+        # 验证：至少需要启用一个NMR模态（C或H），Formula是可选的
+        if not (use_c_nmr or use_h_nmr):
+            raise ValueError("至少需要启用一个NMR模态：USE_C_NMR 或 USE_H_NMR（Formula是可选的）")
+        
+        # 记录消融实验配置
+        logger.info("\n" + "="*80)
+        logger.info("消融实验配置:")
+        logger.info(f"  USE_C_NMR: {use_c_nmr}")
+        logger.info(f"  USE_H_NMR: {use_h_nmr}")
+        logger.info(f"  USE_FORMULA_GUIDANCE: {use_formula}")
+        
+        # 显示当前配置对应的组合
+        modalities = []
+        if use_c_nmr:
+            modalities.append("C")
+        if use_h_nmr:
+            modalities.append("H")
+        if use_formula:
+            modalities.append("Formula")
+        logger.info(f"  当前组合: {'+'.join(modalities)}")
+        logger.info("="*80)
+        
+        # 主模态 encoder（根据配置初始化）
+        if use_c_nmr:
+            self.c_encoder = PeakEncoder(
+                d_model=d_model,
+                n_layers=config.PEAK_ENCODER_N_LAYERS,
+                n_heads=config.PEAK_ENCODER_N_HEADS,
+                ff_dim=config.PEAK_ENCODER_FF_DIM,
+                dropout=config.PEAK_ENCODER_DROPOUT,
+                max_peaks=config.MAX_PEAKS
+            )
+            logger.info("✅ C-NMR encoder 已启用")
+        else:
+            self.c_encoder = None
+            logger.info("❌ C-NMR encoder 已禁用（消融实验）")
+        
+        if use_h_nmr:
+            self.h_encoder = PeakEncoder(
+                d_model=d_model,
+                n_layers=config.PEAK_ENCODER_N_LAYERS,
+                n_heads=config.PEAK_ENCODER_N_HEADS,
+                ff_dim=config.PEAK_ENCODER_FF_DIM,
+                dropout=config.PEAK_ENCODER_DROPOUT,
+                max_peaks=config.MAX_PEAKS
+            )
+            logger.info("✅ H-NMR encoder 已启用")
+        else:
+            self.h_encoder = None
+            logger.info("❌ H-NMR encoder 已禁用（消融实验）")
 
         
         # 添加FormulaEncoder（如果配置中启用了化学式指导）
@@ -263,11 +300,15 @@ class NMR2SMILESModel(pl.LightningModule):
           smiles_ids: tokenized smiles (labels)
         """
 
-        # C-NMR
-        z_c = self.c_encoder(c_peaks) if c_peaks is not None else None
+        # C-NMR（根据配置和输入决定）
+        z_c = None
+        if self.c_encoder is not None and c_peaks is not None:
+            z_c = self.c_encoder(c_peaks)
 
-        # H-NMR
-        z_h = self.h_encoder(h_peaks) if h_peaks is not None else None
+        # H-NMR（根据配置和输入决定）
+        z_h = None
+        if self.h_encoder is not None and h_peaks is not None:
+            z_h = self.h_encoder(h_peaks)
 
         # 新增：处理化学式guidance
         z_guidance = None
@@ -298,8 +339,10 @@ class NMR2SMILESModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         """Training step for autoregressive generation."""
         smiles_ids = batch["smiles"].long()
-        c_peaks = batch.get("c_nmr_peaks")
-        h_peaks = batch.get("h_nmr_peaks")
+        
+        # 根据配置获取输入（消融实验）
+        c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
+        h_peaks = batch.get("h_nmr_peaks") if self.h_encoder is not None else None
         
         # Check for NaN in input data
         if c_peaks is not None and torch.isnan(c_peaks).any():
@@ -378,8 +421,10 @@ class NMR2SMILESModel(pl.LightningModule):
             logger.info(f"{'='*80}")
         
         smiles_ids = batch["smiles"].long()
-        c_peaks = batch.get("c_nmr_peaks")
-        h_peaks = batch.get("h_nmr_peaks")
+        
+        # 根据配置获取输入（消融实验）
+        c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
+        h_peaks = batch.get("h_nmr_peaks") if self.h_encoder is not None else None
         original_smiles_list = batch["original_smiles"]
         formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
 
@@ -407,14 +452,17 @@ class NMR2SMILESModel(pl.LightningModule):
             seq_correct = ((pred_tokens == smiles_ids) | ~valid_mask).all(dim=1)
             seq_acc = seq_correct.float().mean()
         
-        # Log metrics (添加 logger=True 以同步到 SwanLab)
         self.log("val_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
         self.log("val_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
         
         # Generate and log examples
         if batch_idx % 10 == 0 and self.global_rank == 0:
             try:
-                generated = self.generate(c_peaks[:1], h_peaks[:1] if h_peaks is not None else None, formula_vector[:1] if formula_vector is not None else None)
+                # 根据配置安全地获取单个样本用于生成
+                gen_c_peaks = c_peaks[:1] if c_peaks is not None else None
+                gen_h_peaks = h_peaks[:1] if h_peaks is not None else None
+                gen_formula = formula_vector[:1] if formula_vector is not None else None
+                generated = self.generate(gen_c_peaks, gen_h_peaks, gen_formula)
                 generated_smiles = self.tokens_to_smiles(generated[0])
                 original_smiles = original_smiles_list[0]
                 
@@ -457,37 +505,50 @@ class NMR2SMILESModel(pl.LightningModule):
         if max_length is None:
             max_length = self.config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS
         
-        # 检查是否有有效的输入
-        has_nmr = (c_peaks is not None) or (h_peaks is not None)
+        # 检查是否有有效的输入（根据配置）
+        # 至少需要一个NMR模态（C或H），Formula是可选的
+        has_c = self.c_encoder is not None and c_peaks is not None
+        has_h = self.h_encoder is not None and h_peaks is not None
+        has_nmr = has_c or has_h
         has_formula = self.formula_encoder is not None and formula_vector is not None
         
-        if not (has_nmr or has_formula):
-            raise ValueError("At least one of C-NMR peaks, H-NMR peaks, or formula vector must be provided")
+        if not has_nmr:
+            raise ValueError(
+                "至少需要提供一个NMR模态（C或H）："
+                f"C-NMR (enabled={self.c_encoder is not None}, provided={c_peaks is not None}), "
+                f"H-NMR (enabled={self.h_encoder is not None}, provided={h_peaks is not None})"
+            )
         
         with torch.no_grad():
             # 确定设备
             device = next(self.parameters()).device
             
             # 处理单个样本情况（添加批次维度）
+            # 优先从启用的NMR模态确定batch_size
             if batch_size is None:
+                # 优先从C-NMR确定
                 if c_peaks is not None:
                     if c_peaks.dim() == 1:
                         c_peaks = c_peaks.unsqueeze(0)
                         batch_size = 1
                     else:
                         batch_size = c_peaks.shape[0]
+                # 如果C-NMR不可用，从H-NMR确定
                 elif h_peaks is not None:
                     if h_peaks.dim() == 1:
                         h_peaks = h_peaks.unsqueeze(0)
                         batch_size = 1
                     else:
                         batch_size = h_peaks.shape[0]
+                # 如果NMR都不可用（不应该发生，因为前面已验证），从Formula确定
                 elif formula_vector is not None:
                     if formula_vector.dim() == 1:
                         formula_vector = formula_vector.unsqueeze(0)
                         batch_size = 1
                     else:
                         batch_size = formula_vector.shape[0]
+                else:
+                    raise ValueError("无法确定batch_size：所有输入都是None")
             
             # 确保所有输入都在正确设备上
             if c_peaks is not None:
@@ -497,9 +558,14 @@ class NMR2SMILESModel(pl.LightningModule):
             if formula_vector is not None:
                 formula_vector = formula_vector.to(device).float()
             
-            # 编码NMR数据
-            z_c = self.c_encoder(c_peaks) if c_peaks is not None else None
-            z_h = self.h_encoder(h_peaks) if h_peaks is not None else None
+            # 编码NMR数据（根据配置）
+            z_c = None
+            if self.c_encoder is not None and c_peaks is not None:
+                z_c = self.c_encoder(c_peaks)
+            
+            z_h = None
+            if self.h_encoder is not None and h_peaks is not None:
+                z_h = self.h_encoder(h_peaks)
             
             # 编码公式指导
             z_guidance = None

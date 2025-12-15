@@ -210,6 +210,22 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     logger.info(f"训练集样本数: {len(train_dataset)}")
     logger.info(f"验证集样本数: {len(val_dataset)}")
 
+    # 记录消融实验配置
+    use_c_nmr = getattr(config, "USE_C_NMR", True)
+    use_h_nmr = getattr(config, "USE_H_NMR", True)
+    use_formula = getattr(config, "USE_FORMULA_GUIDANCE", True)
+    
+    logger.info("\n" + "="*80)
+    logger.info("实验配置:")
+    logger.info(f"  USE_C_NMR: {use_c_nmr}")
+    logger.info(f"  USE_H_NMR: {use_h_nmr}")
+    logger.info(f"  USE_FORMULA_GUIDANCE: {use_formula}")
+    
+    # 验证配置：至少需要启用一个NMR模态（C或H），Formula是可选的
+    if not (use_c_nmr or use_h_nmr):
+        raise ValueError("至少需要启用一个NMR模态：USE_C_NMR 或 USE_H_NMR（Formula是可选的）")
+    logger.info("="*80 + "\n")
+
     # 创建原子映射
     atom_mapping = None
     if config.USE_FORMULA_GUIDANCE:

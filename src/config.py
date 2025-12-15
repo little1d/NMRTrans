@@ -78,9 +78,13 @@ class TrainingConfig:
     # ========== Data Configuration ==========
     
     # ===== 新增：分子式指导配置 =====
-    USE_FORMULA_GUIDANCE = True  # 启用分子式指导
-    ALL_ATOMS = ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si']  # 从过滤脚本获得
+    USE_FORMULA_GUIDANCE = _get_config("USE_FORMULA_GUIDANCE", True)
+    ALL_ATOMS = ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si']
     FORMULA_VECTOR_SIZE = len(ALL_ATOMS)  # 12
+    
+    # ===== 消融实验配置：控制使用的NMR模态 =====
+    USE_C_NMR = _get_config("USE_C_NMR", True)  # 是否使用 C-NMR
+    USE_H_NMR = _get_config("USE_H_NMR", True)  # 是否使用 H-NMR
     
     # Formula encoder 配置
     FORMULA_ENCODER_D_MODEL = 512  # 与 peak encoder 相同
