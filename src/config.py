@@ -76,6 +76,19 @@ class TrainingConfig:
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
     
     # ========== Data Configuration ==========
+    
+    # ===== 新增：分子式指导配置 =====
+    USE_FORMULA_GUIDANCE = True  # 启用分子式指导
+    ALL_ATOMS = ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si']  # 从过滤脚本获得
+    FORMULA_VECTOR_SIZE = len(ALL_ATOMS)  # 12
+    
+    # Formula encoder 配置
+    FORMULA_ENCODER_D_MODEL = 512  # 与 peak encoder 相同
+    FORMULA_ENCODER_N_LAYERS = 2
+    FORMULA_ENCODER_N_HEADS = 4
+    FORMULA_ENCODER_FF_DIM = 1024
+    FORMULA_ENCODER_DROPOUT = 0.1
+
     # AR project only uses NMR peaks (discrete)
     MAX_PEAKS = _get_config("MAX_PEAKS", 60)  # Maximum number of peaks per spectrum
     MAX_SMILES_LENGTH = 80
@@ -144,7 +157,10 @@ def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):
         if parent_path not in sys.path:
             sys.path.insert(0, parent_path)
         
-        from spectra2smiles.models.tokenizer import RegexSMILESTokenizer
+        try:
+            from tokenizer import RegexSMILESTokenizer
+        except ImportError:
+            from .tokenizer import RegexSMILESTokenizer
         
         vocab_path = config.VOCAB_PATH
         if not vocab_path:

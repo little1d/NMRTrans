@@ -2,20 +2,20 @@
 # This file is not tracked by Git
 
 # Data paths (remove _DEFAULT_ prefix!)
-MERGED_DATA_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/cache"
-VOCAB_PATH = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/vocab.json"
-SAVE_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/checkpoints"
+MERGED_DATA_DIR = "/mnt/shared-storage-user/yangliujia/Spectra2Smiles-AR/datasets/opendatalab_exp_peaks_no_metal"
+VOCAB_PATH = "/mnt/shared-storage-user/yangliujia/spectra_molecule_gen/peaks_to_structure/vocab_regex/vocab.json"
+SAVE_DIR = "/mnt/shared-storage-user/yangliujia/Spectra2Smiles-AR/checkpoints"
 
 # SwanLab configuration
 USE_SWANLAB = True
 SWANLAB_PROJECT = "spectra2smiles"
-SWANLAB_RUN_NAME = "12.12-t5-small-ar-baseline"
+SWANLAB_RUN_NAME = "12.15-formula-t5-small-ar-baseline"
 
 # Device configuration
 DEVICES = 8
 
 # T5 Model - use LOCAL path
-T5_MODEL_NAME = "/mnt/shared-storage-user/yangzhuo/main/models/google-t5/t5-small"
+T5_MODEL_NAME = "/mnt/shared-storage-user/yangliujia/models/t5-small"
 
 # Training hyperparameters
 BATCH_SIZE = 1024

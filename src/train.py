@@ -9,6 +9,8 @@ import time
 import warnings
 from datetime import datetime
 from functools import partial
+import re
+from collections import defaultdict, Counter
 
 import numpy as np
 import pytorch_lightning as pl
@@ -72,15 +74,63 @@ def pad_peak_sequences(peak_sequences, max_peaks):
     
     return padded
 
+def parse_chemical_formula(formula: str) -> dict:
+    """
+    Parse chemical formula string to atom counts dictionary.
+    Example: "C20H18BrNO2" -> {'C': 20, 'H': 18, 'Br': 1, 'N': 1, 'O': 2}
+    """
+    if not formula or formula.strip() == "":
+        return {}
+    
+    # 移除空格并处理常见情况
+    formula = formula.strip()
+    
+    # 使用正则表达式匹配原子符号和数量
+    # 原子符号总是以大写字母开头，可能跟一个小写字母（如Br, Cl等）
+    pattern = r'([A-Z][a-z]?)(\d*)'
+    matches = re.findall(pattern, formula)
+    
+    atom_counts = defaultdict(int)
+    for atom, count in matches:
+        count = int(count) if count else 1
+        atom_counts[atom] += count
+    
+    return dict(atom_counts)
 
-def peaks_collate_fn(batch, tokenizer, config):
-    """处理NMR峰值数据集的collate函数"""
+def parse_chemical_formula_to_vector(formula: str, atom_mapping: dict) -> torch.Tensor:
+    """
+    将化学式转换为原子计数向量
+    
+    Args:
+        formula: 化学式字符串，如"C20H18BrNO2"
+        atom_mapping: 原子到索引的映射字典
+    
+    Returns:
+        torch.Tensor: 原子计数向量，形状为(formula_vector_size,)
+    """
+    if not formula or formula.strip() == "":
+        return torch.zeros(len(atom_mapping), dtype=torch.float)
+    
+    # 解析分子式
+    atoms = parse_chemical_formula(formula)
+    
+    # 创建原子计数向量
+    vec = torch.zeros(len(atom_mapping), dtype=torch.float)
+    for atom, count in atoms.items():
+        if atom in atom_mapping:
+            idx = atom_mapping[atom]
+            vec[idx] = float(count)
+    
+    return vec
+
+def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
+    """处理NMR峰值数据集的collate函数，包含化学式向量"""
     # 过滤None值
     batch = [b for b in batch if b is not None]
     if not batch:
         return None
     
-    # 1. 使用tokenizer对原始SMILES进行编码
+    # 1. 处理SMILES
     original_smiles_list = [item["original_smiles"] for item in batch]
     tokenized_smiles = []
     for smiles in original_smiles_list:
@@ -91,20 +141,18 @@ def peaks_collate_fn(batch, tokenizer, config):
         )
         tokenized_smiles.append(tokens)
     
-    # 填充到相同长度
     max_len = config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS
     padded_smiles = []
     for tokens in tokenized_smiles:
         padded = tokens + [tokenizer.vocab["<pad>"]] * (max_len - len(tokens))
         padded_smiles.append(padded)
     
-    # 转换为tensor
     smiles_tensor = torch.tensor(padded_smiles, dtype=torch.long)
     
     # 2. 处理谱图数据
     spectra_data = {}
     
-    # 检查数据集中是否包含H-NMR
+    # H-NMR处理
     if "h_nmr_peaks" in batch[0] and batch[0]["h_nmr_peaks"] is not None:
         h_peaks_list = []
         for item in batch:
@@ -112,14 +160,11 @@ def peaks_collate_fn(batch, tokenizer, config):
                 h_peaks = torch.tensor(item["h_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
                 h_peaks_list.append(h_peaks)
             else:
-                # 创建一个空的峰点表示
                 h_peaks_list.append(torch.zeros((0, 1)))
-        
-        # 填充到相同长度
         h_peaks_padded = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
         spectra_data["h_nmr_peaks"] = h_peaks_padded
     
-    # 检查数据集中是否包含C-NMR
+    # C-NMR处理
     if "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
         c_peaks_list = []
         for item in batch:
@@ -127,12 +172,27 @@ def peaks_collate_fn(batch, tokenizer, config):
                 c_peaks = torch.tensor(item["c_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
                 c_peaks_list.append(c_peaks)
             else:
-                # 创建一个空的峰点表示
                 c_peaks_list.append(torch.zeros((0, 1)))
-        
-        # 填充到相同长度
         c_peaks_padded = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
         spectra_data["c_nmr_peaks"] = c_peaks_padded
+    
+    # ===== 新增：处理化学式向量 =====
+    if config.USE_FORMULA_GUIDANCE and atom_mapping is not None:
+        formula_vectors = []
+        formula_strings = []  # 用于日志记录
+        
+        for item in batch:
+            formula = item.get("molecular_formula", "")
+            formula_strings.append(formula)
+            
+            # 转换为向量
+            vec = parse_chemical_formula_to_vector(formula, atom_mapping)
+            formula_vectors.append(vec)
+        
+        # 堆叠为batch tensor
+        formula_tensor = torch.stack(formula_vectors)  # (B, formula_vector_size)
+        spectra_data["formula_vector"] = formula_tensor
+        spectra_data["formula_strings"] = formula_strings  # 用于验证时显示
     
     return {
         "smiles": smiles_tensor,
@@ -142,7 +202,7 @@ def peaks_collate_fn(batch, tokenizer, config):
 
 
 def build_dataloaders(config: TrainingConfig, tokenizer):
-    """Build data loaders for training and validation."""
+    """Build data loaders for training and validation with formula guidance."""
     logger.info("Loading datasets...")
     train_dataset = MergedDataset(config.TRAIN_FILE)
     val_dataset = MergedDataset(config.VAL_FILE)
@@ -150,8 +210,22 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     logger.info(f"训练集样本数: {len(train_dataset)}")
     logger.info(f"验证集样本数: {len(val_dataset)}")
 
-    # 创建带tokenizer的partial collate函数
-    collate_fn = partial(peaks_collate_fn, tokenizer=tokenizer, config=config)
+    # 创建原子映射
+    atom_mapping = None
+    if config.USE_FORMULA_GUIDANCE:
+        atom_mapping = {atom: idx for idx, atom in enumerate(config.ALL_ATOMS)}
+        logger.info(f"✅ 使用分子式指导，原子类型: {config.ALL_ATOMS}")
+        logger.info(f"原子映射: {atom_mapping}")
+    else:
+        logger.info("❌ 未使用分子式指导")
+    
+    # 创建带tokenizer和atom_mapping的partial collate函数
+    collate_fn = partial(
+        peaks_collate_fn, 
+        tokenizer=tokenizer, 
+        config=config,
+        atom_mapping=atom_mapping
+    )
 
     common_kwargs = dict(
         pin_memory=True,
@@ -197,6 +271,15 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     if max_id >= len(tokenizer):
         logger.error(f"错误: 最大token ID ({max_id}) 超出词汇表大小 ({len(tokenizer)})")
         logger.error("请检查tokenizer和数据预处理流程")
+    
+    # 验证formula vector维度
+    if config.USE_FORMULA_GUIDANCE:
+        sample_batch = next(iter(train_loader))
+        if "formula_vector" in sample_batch:
+            formula_dim = sample_batch["formula_vector"].shape[1]
+            logger.info(f"✅ Formula vector维度验证: {formula_dim} (预期: {config.FORMULA_VECTOR_SIZE})")
+            if formula_dim != config.FORMULA_VECTOR_SIZE:
+                logger.error(f"维度不匹配! 预期 {config.FORMULA_VECTOR_SIZE}, 实际 {formula_dim}")
     
     return train_loader, val_loader
 
