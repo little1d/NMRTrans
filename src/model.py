@@ -151,60 +151,21 @@ class FusionLayer(nn.Module):
 # ===========================================================
 
 class FormulaEncoder(nn.Module):
-    """
-    输入: (B, formula_vector_size) 的原子计数向量
-    输出: (B, 1, d_model) 的guidance embedding
-    """
-    def __init__(self, formula_vector_size, d_model=512, n_layers=2, n_heads=4, ff_dim=1024, dropout=0.1):
+    def __init__(self, formula_vector_size, d_model=512, hidden_dim=1024):
         super().__init__()
-        
-        self.d_model = d_model
-        
-        # 1. 输入投影层
-        self.input_proj = nn.Linear(formula_vector_size, d_model)
-        
-        # 2. Transformer编码器层
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            dim_feedforward=ff_dim,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=True,
+        self.net = nn.Sequential(
+            nn.Linear(formula_vector_size, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model)
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        
-        # 3. 输出投影层 (压缩为单个向量)
-        self.output_proj = nn.Linear(d_model, d_model)
-        
-        # 4. LayerNorm
-        self.norm = nn.LayerNorm(d_model)
-        
-        # 5. 位置编码 (虽然是单个向量，但为了兼容Transformer架构)
-        self.register_buffer("pos_encoding", torch.zeros(1, 1, d_model))
     
     def forward(self, formula_vector):
-        """
-        formula_vector: (B, formula_vector_size)
-        returns: (B, 1, d_model) - 单个guidance向量
-        """
         if formula_vector is None:
             return None
-        
-        # 1. 输入投影
-        x = self.input_proj(formula_vector)  # (B, d_model)
-        x = x.unsqueeze(1)  # (B, 1, d_model)
-        
-        # 2. 添加位置编码 (虽然是单个token，但保持架构一致性)
-        x = x + self.pos_encoding
-        
-        # 3. Transformer编码
-        x = self.transformer(x)  # (B, 1, d_model)
-        
-        # 4. 输出投影和归一化
-        x = self.output_proj(x)  # (B, 1, d_model)
-        x = self.norm(x)
-        
-        return x  # (B, 1, d_model)
+        x = self.net(formula_vector)  # (B, d_model)
+        return x.unsqueeze(1)  # (B, 1, d_model)
 
 # ===========================================================
 # 4. 主模型：NMR → SMILES（T5 decoder-only）
@@ -253,10 +214,6 @@ class NMR2SMILESModel(pl.LightningModule):
             self.formula_encoder = FormulaEncoder(
                 formula_vector_size=len(config.ALL_ATOMS),
                 d_model=d_model,
-                n_layers=config.FORMULA_ENCODER_N_LAYERS,
-                n_heads=config.FORMULA_ENCODER_N_HEADS,
-                ff_dim=config.FORMULA_ENCODER_FF_DIM,
-                dropout=config.FORMULA_ENCODER_DROPOUT
             )
             logger.info(f"Formula encoder initialized with {len(config.ALL_ATOMS)} atoms")
         else:

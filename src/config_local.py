@@ -9,7 +9,7 @@ SAVE_DIR = "/mnt/shared-storage-user/yangliujia/Spectra2Smiles-AR/checkpoints"
 # SwanLab configuration
 USE_SWANLAB = True
 SWANLAB_PROJECT = "spectra2smiles"
-SWANLAB_RUN_NAME = "12.15-formula-t5-small-ar-baseline"
+SWANLAB_RUN_NAME = "12.15-formula-t5-small-ar-baseline-2"
 
 # Device configuration
 DEVICES = 8
