@@ -483,7 +483,7 @@ class NMR2SMILESModel(pl.LightningModule):
         return {"val_token_acc": token_acc, "val_seq_acc": seq_acc}
     
     def generate(self, c_peaks=None, h_peaks=None, formula_vector=None, max_length=None, num_beams=1, 
-                do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None):
+                do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None, **generate_kwargs):
         """
         Generate SMILES using T5 generation with optional formula guidance.
         
@@ -617,6 +617,15 @@ class NMR2SMILESModel(pl.LightningModule):
             logger.debug(f"  num_beams: {num_beams}")
             logger.debug(f"  do_sample: {do_sample}")
             
+            # 处理 num_return_sequences 与 beam 数的关系，避免 HF 报错
+            num_return_sequences = int(generate_kwargs.get("num_return_sequences", 1))
+            if num_beams < num_return_sequences:
+                num_beams = num_return_sequences
+
+            # 确保 early_stopping 不重复传递
+            if "early_stopping" not in generate_kwargs:
+                generate_kwargs["early_stopping"] = True
+
             try:
                 # 使用T5生成
                 generated_ids = self.t5.generate(
@@ -631,7 +640,7 @@ class NMR2SMILESModel(pl.LightningModule):
                     pad_token_id=self.config.PAD_TOKEN_ID,
                     eos_token_id=self.config.EOS_TOKEN_ID,
                     bos_token_id=self.config.BOS_TOKEN_ID,
-                    early_stopping=True,
+                    **generate_kwargs,
                 )
                 
                 logger.debug(f"Generated IDs shape: {generated_ids.shape}")
@@ -645,13 +654,19 @@ class NMR2SMILESModel(pl.LightningModule):
                 # 尝试更简单的生成方式作为回退
                 try:
                     logger.warning("Attempting fallback generation with minimal parameters")
+                    fallback_kwargs = dict(generate_kwargs)
+                    # 再次确保 beam 与返回序列数兼容
+                    fb_num_return_sequences = int(fallback_kwargs.get("num_return_sequences", 1))
+                    fb_num_beams = max(num_beams, fb_num_return_sequences)
                     generated_ids = self.t5.generate(
                         encoder_outputs=encoder_outputs,
                         attention_mask=attention_mask,
                         max_length=max_length,
+                        num_beams=fb_num_beams,
                         pad_token_id=self.config.PAD_TOKEN_ID,
                         eos_token_id=self.config.EOS_TOKEN_ID,
                         bos_token_id=self.config.BOS_TOKEN_ID,
+                        **fallback_kwargs,
                     )
                     return generated_ids
                 except Exception as e2:

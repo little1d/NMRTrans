@@ -503,6 +503,11 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
         "num_beams": 1,
         "do_sample": False,
     }
+    # Beam search配置，用于计算top-k序列准确率
+    beam_sizes = [3, 5, 10]
+    max_beam = max(beam_sizes)
+    topk_hits = {k: 0 for k in beam_sizes}
+    total_samples = 0
     
     # Initialize metrics
     metrics = {
@@ -555,6 +560,15 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
     example_count = 0
     max_examples = 100
     
+    def _clean_content_tokens(tokens: torch.Tensor, cfg):
+        """去掉 PAD/BOS/EOS，只保留有效内容token。"""
+        mask = (
+            (tokens != cfg.PAD_TOKEN_ID) &
+            (tokens != cfg.BOS_TOKEN_ID) &
+            (tokens != cfg.EOS_TOKEN_ID)
+        )
+        return tokens[mask]
+    
     # Create progress bar with total number of batches
     total_batches = len(test_loader)
     pbar = tqdm(test_loader, desc="Evaluating", total=total_batches, 
@@ -574,6 +588,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
             formula_vector = batch.get("formula_vector") if 'formula' in enabled_features else None
             
             batch_size = smiles_ids.size(0)
+            total_samples += batch_size
             
             try:
                 # ===== Teacher forcing 评估（与训练/validation 对齐）=====
@@ -607,10 +622,25 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     **gen_kwargs
                 )
                 
+                # 额外：Beam search 获取 top-k 序列（用于 top3/5/10 seq acc）
+                beam_generated_ids = model_module.generate(
+                    c_peaks=c_peaks,
+                    h_peaks=h_peaks,
+                    formula_vector=formula_vector,
+                    max_length=config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS,
+                    num_beams=max_beam,
+                    num_return_sequences=max_beam,
+                    do_sample=False,
+                    early_stopping=True,
+                )
+                # 形状调整为 (B, max_beam, seq_len)
+                beam_generated_ids = beam_generated_ids.view(batch_size, max_beam, -1)
+                
                 # Calculate metrics for each sample
                 for i in range(batch_size):
                     true_tokens = smiles_ids[i]
                     gen_tokens = generated_ids[i]
+                    beam_tokens = beam_generated_ids[i]
                     
                     # Convert to SMILES strings
                     true_smiles = model_module.tokens_to_smiles(true_tokens)
@@ -663,6 +693,19 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     
                     # Calculate Tanimoto similarity with ground truth
                     similarity = calculate_smiles_similarity(true_smiles, gen_smiles)
+                    
+                    # ===== Beam search top-k 序列准确率（精确匹配内容token）=====
+                    true_content = _clean_content_tokens(true_tokens, config)
+                    for k in beam_sizes:
+                        candidates = beam_tokens[:k]  # (k, seq_len)
+                        hit = False
+                        for cand in candidates:
+                            cand_content = _clean_content_tokens(cand, config)
+                            if cand_content.shape[0] == true_content.shape[0] and torch.equal(cand_content, true_content):
+                                hit = True
+                                break
+                        if hit:
+                            topk_hits[k] += 1
                     
                     # Record metrics
                     metrics["token_acc"].append(token_acc.item())
@@ -733,6 +776,8 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
         # Teacher forcing metrics
         "teacher_forcing_token_accuracy": np.mean(tf_metrics["token_acc"]) if len(tf_metrics["token_acc"]) > 0 else None,
         "teacher_forcing_sequence_accuracy": np.mean(tf_metrics["seq_acc"]) if len(tf_metrics["seq_acc"]) > 0 else None,
+        # Beam search top-k seq accuracy
+        "topk_sequence_accuracy": {k: topk_hits[k] / total_samples for k in topk_hits},
     }
     
     # Calculate grouped metrics
@@ -780,6 +825,9 @@ def print_results(results, enabled_features=None):
         logger.info(f"  TF Token Accuracy (teacher forcing): {metrics['teacher_forcing_token_accuracy']:.4f}")
     if metrics.get("teacher_forcing_sequence_accuracy") is not None:
         logger.info(f"  TF Sequence Accuracy (teacher forcing): {metrics['teacher_forcing_sequence_accuracy']:.4f}")
+    if metrics.get("topk_sequence_accuracy"):
+        topk_str = ", ".join([f"top{k}: {metrics['topk_sequence_accuracy'][k]:.4f}" for k in sorted(metrics["topk_sequence_accuracy"].keys())])
+        logger.info(f"  Beam Search Seq Acc ({topk_str})")
     logger.info(f"  Total Samples: {metrics['total_samples']}")
     
     # Print grouped metrics
