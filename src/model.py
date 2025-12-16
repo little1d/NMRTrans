@@ -260,7 +260,8 @@ class NMR2SMILESModel(pl.LightningModule):
         self.fusion = FusionLayer(d_model=d_model)
 
         # T5 用于 decoder-only（但依然 load 整个模型）
-        logger.info(f"Loading T5 model from: {config.T5_MODEL_NAME}")
+        # Note: This loads the T5 architecture. Actual weights will be loaded from checkpoint.
+        logger.debug(f"Initializing T5 model architecture from: {config.T5_MODEL_NAME}")
         self.t5 = T5ForConditionalGeneration.from_pretrained(
             config.T5_MODEL_NAME,
             local_files_only=True  # Use local model files only, don't access network
@@ -631,7 +632,6 @@ class NMR2SMILESModel(pl.LightningModule):
                     eos_token_id=self.config.EOS_TOKEN_ID,
                     bos_token_id=self.config.BOS_TOKEN_ID,
                     early_stopping=True,
-                    no_repeat_ngram_size=2,
                 )
                 
                 logger.debug(f"Generated IDs shape: {generated_ids.shape}")
@@ -740,7 +740,7 @@ class NMR2SMILESModel(pl.LightningModule):
             "scheduler": optim.lr_scheduler.LambdaLR(optimizer, warmup_step),
             "interval": "step",  # Use step instead of epoch
         }
-        
+
         return [optimizer], [scheduler]
 
 

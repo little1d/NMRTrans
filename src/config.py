@@ -70,7 +70,7 @@ class TrainingConfig:
     MERGED_DATA_DIR = _get_config("MERGED_DATA_DIR", _DEFAULT_MERGED_DATA_DIR)
     TRAIN_FILE = os.path.join(MERGED_DATA_DIR, "train.pkl.lz4")
     VAL_FILE = os.path.join(MERGED_DATA_DIR, "val.pkl.lz4")
-    TEST_FILE = os.path.join(MERGED_DATA_DIR, "test.pkl.lz4")
+    TEST_FILE = _get_config("TEST_FILE", os.path.join(MERGED_DATA_DIR, "test.pkl.lz4"))
     
     VOCAB_PATH = _get_config("VOCAB_PATH", _DEFAULT_VOCAB_PATH)
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
@@ -155,16 +155,15 @@ class TrainingConfig:
 def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):
     """Load custom RegexSMILESTokenizer and populate config token ids."""
     try:
-        # Import from parent package
+        # Import from same directory (src/)
         import sys
-        parent_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../'))
-        if parent_path not in sys.path:
-            sys.path.insert(0, parent_path)
+        # 获取 src 目录路径（config.py 所在的目录）
+        src_path = os.path.dirname(os.path.abspath(__file__))
+        if src_path not in sys.path:
+            sys.path.insert(0, src_path)
         
-        try:
-            from tokenizer import RegexSMILESTokenizer
-        except ImportError:
-            from .tokenizer import RegexSMILESTokenizer
+        # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
+        from tokenizer import RegexSMILESTokenizer
         
         vocab_path = config.VOCAB_PATH
         if not vocab_path:
