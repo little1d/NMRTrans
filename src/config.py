@@ -101,6 +101,7 @@ class TrainingConfig:
     # ========== T5 Model Configuration ==========
     T5_MODEL_NAME = _get_config("T5_MODEL_NAME", "t5-small")  # t5-small, t5-base, t5-large
     FREEZE_T5_DECODER = _get_config("FREEZE_T5_DECODER", False)
+    USE_RANDOM_T5_INIT = _get_config("USE_RANDOM_T5_INIT", False)
     
     # ========== Peak Encoder Configuration ==========
     PEAK_ENCODER_D_MODEL = _get_config("PEAK_ENCODER_D_MODEL", 512)

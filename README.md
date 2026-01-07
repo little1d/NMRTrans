@@ -6,7 +6,7 @@ Spectra2Smiles-AR/
 │   ├── config_local.py    # 本地配置
 │   ├── data.py            # MergedDataset数据加载
 │   ├── model.py           # T5-based AR模型
-│   └── train.py           # 训练脚本（带时间戳日志）
+│   └── train.py           # 训练脚本
 └── scripts/
     ├── rjob.sh
     └── start_training.sh

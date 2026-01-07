@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
-from transformers import T5ForConditionalGeneration
+from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
 logger = logging.getLogger(__name__)
@@ -262,12 +262,24 @@ class NMR2SMILESModel(pl.LightningModule):
         # T5 用于 decoder-only（但依然 load 整个模型）
         # Note: This loads the T5 architecture. Actual weights will be loaded from checkpoint.
         logger.debug(f"Initializing T5 model architecture from: {config.T5_MODEL_NAME}")
-        self.t5 = T5ForConditionalGeneration.from_pretrained(
-            config.T5_MODEL_NAME,
-            local_files_only=True  # Use local model files only, don't access network
-        )
+        if getattr(config, "USE_RANDOM_T5_INIT", False):
+            # 使用 T5Config 随机初始化（不加载预训练权重）
+            t5_config = T5Config.from_pretrained(
+                config.T5_MODEL_NAME,
+                local_files_only=True
+            )
+            t5_config.vocab_size = len(tokenizer)
+            self.t5 = T5ForConditionalGeneration(t5_config)
+        else:
+            self.t5 = T5ForConditionalGeneration.from_pretrained(
+                config.T5_MODEL_NAME,
+                local_files_only=True  # Use local model files only, don't access network
+            )
         
-        # IMPORTANT: Set T5 to training mode
+        # 对齐 T5 的词表大小与自定义 SMILES tokenizer，确保 embedding / lm_head 尺寸一致
+        self._resize_t5_embeddings_to_tokenizer()
+        
+        # Set T5 to training mode
         self.t5.train()
         
         # Optionally freeze T5 decoder
@@ -757,6 +769,16 @@ class NMR2SMILESModel(pl.LightningModule):
         }
 
         return [optimizer], [scheduler]
+
+    def _resize_t5_embeddings_to_tokenizer(self):
+        """Resize T5 embeddings and LM head to match the custom SMILES tokenizer."""
+        vocab_size = len(self.tokenizer)
+        current_size = self.t5.config.vocab_size
+        if vocab_size == current_size:
+            return
+        # 这一行会同时调整 shared embedding 和 lm_head 的权重尺寸
+        self.t5.resize_token_embeddings(vocab_size)
+        self.t5.config.vocab_size = vocab_size
 
 
 __all__ = ["NMR2SMILESModel", "PeakEncoder", "FusionLayer"]
