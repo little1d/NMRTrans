@@ -51,6 +51,20 @@ def _get_config(key: str, default):
     return default
 
 
+def _infer_t5_d_model(model_name: str, fallback: int = 512) -> int:
+    """Infer T5 d_model size from model name or path."""
+    name = os.path.basename(str(model_name)).lower()
+    t5_d_model_map = {
+        "t5-small": 512,
+        "t5-base": 768,
+        "t5-large": 1024,
+    }
+    for key, value in t5_d_model_map.items():
+        if key in name:
+            return value
+    return fallback
+
+
 # Default paths (will be overridden by config_local.py if it exists)
 _DEFAULT_MERGED_DATA_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/cache/MSD_data"
 _DEFAULT_VOCAB_PATH = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/vocab.json"
@@ -104,7 +118,10 @@ class TrainingConfig:
     USE_RANDOM_T5_INIT = _get_config("USE_RANDOM_T5_INIT", False)
     
     # ========== Peak Encoder Configuration ==========
-    PEAK_ENCODER_D_MODEL = _get_config("PEAK_ENCODER_D_MODEL", 512)
+    PEAK_ENCODER_D_MODEL = _get_config(
+        "PEAK_ENCODER_D_MODEL",
+        _infer_t5_d_model(_get_config("T5_MODEL_NAME", "t5-small")),
+    )
     PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 6)  # 增加到6层
     PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 8)  # 增加注意力头
     PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 2048)  # 增加FFN维度
