@@ -126,6 +126,10 @@ class TrainingConfig:
     PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 8)  # 增加注意力头
     PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 2048)  # 增加FFN维度
     PEAK_ENCODER_DROPOUT = _get_config("PEAK_ENCODER_DROPOUT", 0.1)  # 添加 dropout
+    # ========== NMR Augmentation ==========
+    USE_NMR_JITTER = _get_config("USE_NMR_JITTER", False)
+    NMR_JITTER_RANGE_C = _get_config("NMR_JITTER_RANGE_C", 2.0)
+    NMR_JITTER_RANGE_H = _get_config("NMR_JITTER_RANGE_H", 0.2)
     
     # ========== Training Hyperparameters ==========
     BATCH_SIZE = _get_config("BATCH_SIZE", 1024)

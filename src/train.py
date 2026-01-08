@@ -128,7 +128,7 @@ def parse_chemical_formula_to_vector(formula: str, atom_mapping: dict) -> torch.
     
     return vec
 
-def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
+def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=False):
     """处理NMR峰值数据集的collate函数，包含化学式向量"""
     # 过滤None值
     batch = [b for b in batch if b is not None]
@@ -162,7 +162,11 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
         h_peaks_list = []
         for item in batch:
             if item["h_nmr_peaks"] is not None and len(item["h_nmr_peaks"]) > 0:
-                h_peaks = torch.tensor(item["h_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
+                h_peaks = torch.tensor(item["h_nmr_peaks"], dtype=torch.float)
+                if apply_jitter and config.NMR_JITTER_RANGE_H > 0:
+                    jitter = torch.empty_like(h_peaks).uniform_(-config.NMR_JITTER_RANGE_H, config.NMR_JITTER_RANGE_H)
+                    h_peaks = h_peaks + jitter
+                h_peaks = h_peaks.unsqueeze(-1)
                 h_peaks_list.append(h_peaks)
             else:
                 h_peaks_list.append(torch.zeros((0, 1)))
@@ -183,7 +187,11 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
         c_peaks_list = []
         for item in batch:
             if item["c_nmr_peaks"] is not None and len(item["c_nmr_peaks"]) > 0:
-                c_peaks = torch.tensor(item["c_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
+                c_peaks = torch.tensor(item["c_nmr_peaks"], dtype=torch.float)
+                if apply_jitter and config.NMR_JITTER_RANGE_C > 0:
+                    jitter = torch.empty_like(c_peaks).uniform_(-config.NMR_JITTER_RANGE_C, config.NMR_JITTER_RANGE_C)
+                    c_peaks = c_peaks + jitter
+                c_peaks = c_peaks.unsqueeze(-1)
                 c_peaks_list.append(c_peaks)
             else:
                 c_peaks_list.append(torch.zeros((0, 1)))
@@ -259,16 +267,23 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
         logger.info("❌ 未使用分子式指导")
     
     # 创建带tokenizer和atom_mapping的partial collate函数
-    collate_fn = partial(
-        peaks_collate_fn, 
-        tokenizer=tokenizer, 
+    train_collate_fn = partial(
+        peaks_collate_fn,
+        tokenizer=tokenizer,
         config=config,
-        atom_mapping=atom_mapping
+        atom_mapping=atom_mapping,
+        apply_jitter=getattr(config, "USE_NMR_JITTER", False),
+    )
+    val_collate_fn = partial(
+        peaks_collate_fn,
+        tokenizer=tokenizer,
+        config=config,
+        atom_mapping=atom_mapping,
+        apply_jitter=False,
     )
 
     common_kwargs = dict(
         pin_memory=True,
-        collate_fn=collate_fn
     )
     
     if config.NUM_DATA_WORKERS > 0:
@@ -286,6 +301,7 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
         train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
+        collate_fn=train_collate_fn,
         **common_kwargs,
     )
     
@@ -293,6 +309,7 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
         val_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
+        collate_fn=val_collate_fn,
         **common_kwargs,
     )
 
