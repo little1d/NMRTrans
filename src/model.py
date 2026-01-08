@@ -275,9 +275,8 @@ class NMR2SMILESModel(pl.LightningModule):
                 config.T5_MODEL_NAME,
                 local_files_only=True  # Use local model files only, don't access network
             )
-        
-        # 对齐 T5 的词表大小与自定义 SMILES tokenizer，确保 embedding / lm_head 尺寸一致
-        self._resize_t5_embeddings_to_tokenizer()
+            # 对齐 T5 的词表大小与自定义 SMILES tokenizer，确保 embedding / lm_head 尺寸一致
+            self._resize_t5_embeddings_to_tokenizer()
         
         # Set T5 to training mode
         self.t5.train()
