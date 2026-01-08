@@ -48,9 +48,10 @@ class PeakEncoder(nn.Module):
         # 5. 输出 LayerNorm
         self.output_norm = nn.LayerNorm(d_model)
     
-    def forward(self, peaks):
+    def forward(self, peaks, mask=None):
         """
         peaks: list of lists → 已转换成 padded tensor (B, L) or (B, L, 1)
+        mask: (B, L) with 1 for valid peaks and 0 for padding (optional)
         returns: (B, L, d_model) - 保留序列维度
         """
         if peaks is None:
@@ -86,7 +87,12 @@ class PeakEncoder(nn.Module):
         x = self.input_norm(x)
 
         # 4. Transformer 编码（带 dropout）
-        x = self.transformer(x)   # (B, L, d_model)
+        if mask is not None:
+            # src_key_padding_mask: True for padding positions, False for valid
+            src_key_padding_mask = (mask == 0)
+        else:
+            src_key_padding_mask = None
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)   # (B, L, d_model)
 
         # Check for NaN/Inf after transformer
         if torch.isnan(x).any() or torch.isinf(x).any():
@@ -303,6 +309,8 @@ class NMR2SMILESModel(pl.LightningModule):
         smiles_ids=None,
         attention_mask=None,
         formula_vector=None,
+        c_nmr_mask=None,
+        h_nmr_mask=None,
         **kwargs
     ):
         """
@@ -315,12 +323,12 @@ class NMR2SMILESModel(pl.LightningModule):
         # C-NMR（根据配置和输入决定）
         z_c = None
         if self.c_encoder is not None and c_peaks is not None:
-            z_c = self.c_encoder(c_peaks)
+            z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
 
         # H-NMR（根据配置和输入决定）
         z_h = None
         if self.h_encoder is not None and h_peaks is not None:
-            z_h = self.h_encoder(h_peaks)
+            z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
 
         # 新增：处理化学式guidance
         z_guidance = None
@@ -334,11 +342,33 @@ class NMR2SMILESModel(pl.LightningModule):
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
 
         # Create encoder attention mask for the peak sequence
-        # encoder_hidden: (B, L, d_model) where L = num_c_peaks + num_h_peaks
+        # encoder_hidden: (B, L, d_model) where L = num_c_peaks + num_h_peaks (+ formula)
         batch_size, seq_len, _ = encoder_hidden.shape
-        
-        # Create mask: all ones since all peaks are valid (no padding in peaks)
-        encoder_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
+
+        mask_list = []
+        if c_nmr_mask is not None:
+            mask_list.append(c_nmr_mask)
+        if h_nmr_mask is not None:
+            mask_list.append(h_nmr_mask)
+
+        if len(mask_list) > 0:
+            encoder_attention_mask = torch.cat(mask_list, dim=1)
+            if z_guidance is not None:
+                formula_mask = torch.ones(batch_size, 1, dtype=torch.long, device=encoder_attention_mask.device)
+                encoder_attention_mask = torch.cat([encoder_attention_mask, formula_mask], dim=1)
+        else:
+            # Fallback: no masks provided
+            encoder_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
+
+        if encoder_attention_mask.shape[1] != seq_len:
+            if encoder_attention_mask.shape[1] > seq_len:
+                encoder_attention_mask = encoder_attention_mask[:, :seq_len]
+            else:
+                padding = torch.zeros(
+                    batch_size, seq_len - encoder_attention_mask.shape[1],
+                    dtype=torch.long, device=encoder_attention_mask.device
+                )
+                encoder_attention_mask = torch.cat([encoder_attention_mask, padding], dim=1)
 
         # 送入 T5 decoder
         outputs = self.t5(
@@ -355,6 +385,8 @@ class NMR2SMILESModel(pl.LightningModule):
         # 根据配置获取输入（消融实验）
         c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
         h_peaks = batch.get("h_nmr_peaks") if self.h_encoder is not None else None
+        c_nmr_mask = batch.get("c_nmr_mask") if self.c_encoder is not None else None
+        h_nmr_mask = batch.get("h_nmr_mask") if self.h_encoder is not None else None
         
         # Check for NaN in input data
         if c_peaks is not None and torch.isnan(c_peaks).any():
@@ -373,7 +405,9 @@ class NMR2SMILESModel(pl.LightningModule):
             c_peaks=c_peaks,
             h_peaks=h_peaks,
             formula_vector=formula_vector,
-            smiles_ids=labels
+            smiles_ids=labels,
+            c_nmr_mask=c_nmr_mask,
+            h_nmr_mask=h_nmr_mask,
         )
         
         loss = outputs.loss
@@ -437,6 +471,8 @@ class NMR2SMILESModel(pl.LightningModule):
         # 根据配置获取输入（消融实验）
         c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
         h_peaks = batch.get("h_nmr_peaks") if self.h_encoder is not None else None
+        c_nmr_mask = batch.get("c_nmr_mask") if self.c_encoder is not None else None
+        h_nmr_mask = batch.get("h_nmr_mask") if self.h_encoder is not None else None
         original_smiles_list = batch["original_smiles"]
         formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
 
@@ -449,7 +485,9 @@ class NMR2SMILESModel(pl.LightningModule):
                 c_peaks=c_peaks,
                 h_peaks=h_peaks,
                 formula_vector=formula_vector,
-                smiles_ids=labels
+                smiles_ids=labels,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
             )
             
             logits = outputs.logits
@@ -474,7 +512,15 @@ class NMR2SMILESModel(pl.LightningModule):
                 gen_c_peaks = c_peaks[:1] if c_peaks is not None else None
                 gen_h_peaks = h_peaks[:1] if h_peaks is not None else None
                 gen_formula = formula_vector[:1] if formula_vector is not None else None
-                generated = self.generate(gen_c_peaks, gen_h_peaks, gen_formula)
+                gen_c_mask = c_nmr_mask[:1] if c_nmr_mask is not None else None
+                gen_h_mask = h_nmr_mask[:1] if h_nmr_mask is not None else None
+                generated = self.generate(
+                    gen_c_peaks,
+                    gen_h_peaks,
+                    gen_formula,
+                    c_nmr_mask=gen_c_mask,
+                    h_nmr_mask=gen_h_mask,
+                )
                 generated_smiles = self.tokens_to_smiles(generated[0])
                 original_smiles = original_smiles_list[0]
                 
@@ -494,7 +540,8 @@ class NMR2SMILESModel(pl.LightningModule):
         return {"val_token_acc": token_acc, "val_seq_acc": seq_acc}
     
     def generate(self, c_peaks=None, h_peaks=None, formula_vector=None, max_length=None, num_beams=1, 
-                do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None, **generate_kwargs):
+                do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None,
+                c_nmr_mask=None, h_nmr_mask=None, **generate_kwargs):
         """
         Generate SMILES using T5 generation with optional formula guidance.
         
@@ -569,15 +616,19 @@ class NMR2SMILESModel(pl.LightningModule):
                 h_peaks = h_peaks.to(device).float()
             if formula_vector is not None:
                 formula_vector = formula_vector.to(device).float()
+            if c_nmr_mask is not None:
+                c_nmr_mask = c_nmr_mask.to(device).long()
+            if h_nmr_mask is not None:
+                h_nmr_mask = h_nmr_mask.to(device).long()
             
             # 编码NMR数据（根据配置）
             z_c = None
             if self.c_encoder is not None and c_peaks is not None:
-                z_c = self.c_encoder(c_peaks)
+                z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
             
             z_h = None
             if self.h_encoder is not None and h_peaks is not None:
-                z_h = self.h_encoder(h_peaks)
+                z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
             
             # 编码公式指导
             z_guidance = None
@@ -618,7 +669,29 @@ class NMR2SMILESModel(pl.LightningModule):
             # 创建attention mask
             batch_size_actual = encoder_hidden.shape[0]
             seq_len = encoder_hidden.shape[1]
-            attention_mask = torch.ones(batch_size_actual, seq_len, dtype=torch.long, device=device)
+            mask_list = []
+            if c_nmr_mask is not None:
+                mask_list.append(c_nmr_mask)
+            if h_nmr_mask is not None:
+                mask_list.append(h_nmr_mask)
+
+            if len(mask_list) > 0:
+                attention_mask = torch.cat(mask_list, dim=1)
+                if z_guidance is not None:
+                    formula_mask = torch.ones(batch_size_actual, 1, dtype=torch.long, device=device)
+                    attention_mask = torch.cat([attention_mask, formula_mask], dim=1)
+            else:
+                attention_mask = torch.ones(batch_size_actual, seq_len, dtype=torch.long, device=device)
+
+            if attention_mask.shape[1] != seq_len:
+                if attention_mask.shape[1] > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
+                else:
+                    padding = torch.zeros(
+                        batch_size_actual, seq_len - attention_mask.shape[1],
+                        dtype=torch.long, device=device
+                    )
+                    attention_mask = torch.cat([attention_mask, padding], dim=1)
             
             # 打印调试信息
             logger.debug(f"Generate input shapes:")

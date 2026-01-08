@@ -56,23 +56,25 @@ logger.info(f"Log file: {log_filename}")
 
 
 def pad_peak_sequences(peak_sequences, max_peaks):
-    """将不等长的峰点序列填充到相同长度"""
+    """将不等长的峰点序列填充到相同长度，并返回mask（1=valid, 0=pad）。"""
     batch_size = len(peak_sequences)
     if batch_size == 0:
-        return torch.zeros(0, max_peaks, 1)
+        return torch.zeros(0, max_peaks, 1), torch.zeros(0, max_peaks)
     
     max_len = min(max(len(seq) for seq in peak_sequences if len(seq) > 0), max_peaks)
     
     # 创建填充后的张量，形状为 [batch_size, max_peaks, 1]
     padded = torch.zeros(batch_size, max_peaks, 1)
+    mask = torch.zeros(batch_size, max_peaks, dtype=torch.long)
     
     for i, peaks in enumerate(peak_sequences):
         # 只取前max_peaks个峰点
         num_peaks = min(len(peaks), max_peaks)
         if num_peaks > 0:
             padded[i, :num_peaks] = peaks[:num_peaks]
+            mask[i, :num_peaks] = 1
     
-    return padded
+    return padded, mask
 
 def parse_chemical_formula(formula: str) -> dict:
     """
@@ -161,8 +163,9 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
                 h_peaks_list.append(h_peaks)
             else:
                 h_peaks_list.append(torch.zeros((0, 1)))
-        h_peaks_padded = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
+        h_peaks_padded, h_mask = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
         spectra_data["h_nmr_peaks"] = h_peaks_padded
+        spectra_data["h_nmr_mask"] = h_mask
     
     # C-NMR处理
     if "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
@@ -173,8 +176,9 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
                 c_peaks_list.append(c_peaks)
             else:
                 c_peaks_list.append(torch.zeros((0, 1)))
-        c_peaks_padded = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
+        c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
         spectra_data["c_nmr_peaks"] = c_peaks_padded
+        spectra_data["c_nmr_mask"] = c_mask
     
     # ===== 新增：处理化学式向量 =====
     if config.USE_FORMULA_GUIDANCE and atom_mapping is not None:

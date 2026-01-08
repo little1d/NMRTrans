@@ -142,19 +142,21 @@ def calculate_smiles_similarity(smiles1: str, smiles2: str) -> float:
         return -1.0
 
 def pad_peak_sequences(peak_sequences, max_peaks):
-    """Pad peak sequences to the same length"""
+    """Pad peak sequences to the same length and return mask (1=valid, 0=pad)."""
     batch_size = len(peak_sequences)
     max_len = min(max(len(seq) for seq in peak_sequences), max_peaks)
     
     # Create padded tensor with shape [batch_size, max_peaks, 1]
     padded = torch.zeros(batch_size, max_peaks, 1)
+    mask = torch.zeros(batch_size, max_peaks, dtype=torch.long)
     
     for i, peaks in enumerate(peak_sequences):
         num_peaks = min(len(peaks), max_peaks)
         if num_peaks > 0:
             padded[i, :num_peaks] = peaks[:num_peaks]
+            mask[i, :num_peaks] = 1
     
-    return padded
+    return padded, mask
 
 def parse_chemical_formula(formula: str) -> dict:
     """Parse chemical formula string to atom counts dictionary."""
@@ -237,8 +239,9 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_featur
                 h_peaks_list.append(h_peaks)
             else:
                 h_peaks_list.append(torch.zeros((0, 1)))
-        h_peaks_padded = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
+        h_peaks_padded, h_mask = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
         spectra_data["h_nmr_peaks"] = h_peaks_padded
+        spectra_data["h_nmr_mask"] = h_mask
     
     # C-NMR processing
     if 'c_nmr' in enabled_features and "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
@@ -249,8 +252,9 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_featur
                 c_peaks_list.append(c_peaks)
             else:
                 c_peaks_list.append(torch.zeros((0, 1)))
-        c_peaks_padded = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
+        c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
         spectra_data["c_nmr_peaks"] = c_peaks_padded
+        spectra_data["c_nmr_mask"] = c_mask
     
     # Process formula vector
     if 'formula' in enabled_features and config.USE_FORMULA_GUIDANCE and atom_mapping is not None:
@@ -585,6 +589,8 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
             # Get inputs based on enabled features
             c_peaks = batch.get("c_nmr_peaks") if 'c_nmr' in enabled_features else None
             h_peaks = batch.get("h_nmr_peaks") if 'h_nmr' in enabled_features else None
+            c_nmr_mask = batch.get("c_nmr_mask") if 'c_nmr' in enabled_features else None
+            h_nmr_mask = batch.get("h_nmr_mask") if 'h_nmr' in enabled_features else None
             formula_vector = batch.get("formula_vector") if 'formula' in enabled_features else None
             
             batch_size = smiles_ids.size(0)
@@ -599,6 +605,8 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     h_peaks=h_peaks,
                     formula_vector=formula_vector,
                     smiles_ids=labels,
+                    c_nmr_mask=c_nmr_mask,
+                    h_nmr_mask=h_nmr_mask,
                 )
                 tf_logits = tf_outputs.logits
                 tf_pred_tokens = tf_logits.argmax(dim=-1)
@@ -619,6 +627,8 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     h_peaks=h_peaks,
                     formula_vector=formula_vector,
                     max_length=config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS,
+                    c_nmr_mask=c_nmr_mask,
+                    h_nmr_mask=h_nmr_mask,
                     **gen_kwargs
                 )
                 
@@ -632,6 +642,8 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     num_return_sequences=max_beam,
                     do_sample=False,
                     early_stopping=True,
+                    c_nmr_mask=c_nmr_mask,
+                    h_nmr_mask=h_nmr_mask,
                 )
                 # 形状调整为 (B, max_beam, seq_len)
                 beam_generated_ids = beam_generated_ids.view(batch_size, max_beam, -1)
