@@ -57,6 +57,9 @@ logger.info(f"Log file: {log_filename}")
 
 def pad_peak_sequences(peak_sequences, max_peaks):
     """将不等长的峰点序列填充到相同长度，并返回mask（1=valid, 0=pad）。"""
+    if not hasattr(pad_peak_sequences, "_logged"):
+        logger.info("Peak padding uses 0 values with explicit masks (1=valid, 0=pad).")
+        pad_peak_sequences._logged = True
     batch_size = len(peak_sequences)
     if batch_size == 0:
         return torch.zeros(0, max_peaks, 1), torch.zeros(0, max_peaks)
@@ -166,6 +169,14 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
         h_peaks_padded, h_mask = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
         spectra_data["h_nmr_peaks"] = h_peaks_padded
         spectra_data["h_nmr_mask"] = h_mask
+
+        if not hasattr(peaks_collate_fn, "_logged_h_sample"):
+            sample_peaks = h_peaks_padded[0].squeeze(-1).tolist()
+            sample_mask = h_mask[0].tolist()
+            logger.info("H-NMR padding sample (first item):")
+            logger.info(f"  padded_peaks={sample_peaks}")
+            logger.info(f"  mask={sample_mask}")
+            peaks_collate_fn._logged_h_sample = True
     
     # C-NMR处理
     if "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
@@ -179,6 +190,14 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None):
         c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
         spectra_data["c_nmr_peaks"] = c_peaks_padded
         spectra_data["c_nmr_mask"] = c_mask
+
+        if not hasattr(peaks_collate_fn, "_logged_c_sample"):
+            sample_peaks = c_peaks_padded[0].squeeze(-1).tolist()
+            sample_mask = c_mask[0].tolist()
+            logger.info("C-NMR padding sample (first item):")
+            logger.info(f"  padded_peaks={sample_peaks}")
+            logger.info(f"  mask={sample_mask}")
+            peaks_collate_fn._logged_c_sample = True
     
     # ===== 新增：处理化学式向量 =====
     if config.USE_FORMULA_GUIDANCE and atom_mapping is not None:

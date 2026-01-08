@@ -283,6 +283,11 @@ class NMR2SMILESModel(pl.LightningModule):
             )
             # 对齐 T5 的词表大小与自定义 SMILES tokenizer，确保 embedding / lm_head 尺寸一致
             self._resize_t5_embeddings_to_tokenizer()
+
+        # Log final embedding/LM head shapes for sanity check
+        embed_shape = tuple(self.t5.get_input_embeddings().weight.shape)
+        lm_head_shape = tuple(self.t5.lm_head.weight.shape)
+        logger.info(f"T5 embedding shape: {embed_shape}, LM head shape: {lm_head_shape}")
         
         # Set T5 to training mode
         self.t5.train()
