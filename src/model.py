@@ -923,39 +923,32 @@ class NMR2SMILESModel(pl.LightningModule):
         
         token_strings: List[str] = []
         found_eos = False
-        pad_count = 0
         
         for i, token in enumerate(tokens):
+            # Stop at EOS token
             if found_eos:
-                if token == self.config.PAD_TOKEN_ID:
-                    pad_count += 1
-                    if pad_count == 1:
-                        token_strings.append("<pad>")
-                continue
+                break
             
             token_id = int(token)
             
-            # 处理特殊token
+            # Handle special tokens - use them as markers but don't include in output
             if token_id == self.config.EOS_TOKEN_ID:
-                token_strings.append("<eos>")
                 found_eos = True
-                continue
+                break  # Stop here, don't include <eos> in output
             elif token_id == self.config.BOS_TOKEN_ID:
-                token_strings.append("<bos>")
-                continue
+                continue  # Skip <bos>, don't include in output
             elif token_id == self.config.PAD_TOKEN_ID:
-                token_strings.append("<pad>")
-                continue
+                continue  # Skip <pad>, don't include in output
             else:
-                # 普通token
+                # Normal token
                 try:
                     token_str = self.tokenizer.convert_ids_to_tokens(token_id)
                     if isinstance(token_str, list):
                         token_str = token_str[0]
                     token_strings.append(token_str)
                 except Exception:
-                    # 如果tokenizer无法转换，显示未知token
-                    token_strings.append(f"[UNK_{token_id}]")
+                    # If tokenizer can't convert, skip unknown token
+                    pass
         
         smiles = "".join(token_strings)
         smiles = re.sub(r"\s+", "", smiles)
