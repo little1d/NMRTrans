@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 from rdkit import Chem, DataStructs, rdBase
 from rdkit.Chem import AllChem
 
+
+
 # ===========================================================
 # 1. PeakEncoder —— 用于 H-NMR 与 C-NMR（输入 list[float]）
 # ===========================================================
@@ -35,13 +37,14 @@ class PeakEncoder(nn.Module):
         # 3. 输入 LayerNorm
         self.input_norm = nn.LayerNorm(d_model)
         
-        # 4. Transformer 编码器（带 dropout）
+        # 4. Transformer 编码器（带 dropout，使用 Pre-LN 提升梯度稳定性）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             dim_feedforward=ff_dim,
             nhead=n_heads,
             dropout=dropout,
             batch_first=True,
+            norm_first=True,  # Pre-LN: 在残差相加前进行归一化，梯度更稳定
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
