@@ -95,7 +95,7 @@ class BestModelCheckpoint(ModelCheckpoint):
         monitor: str = "val_seq_acc",
         mode: str = "max",
         save_top_k: int = 3,
-        filename: str = "ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
+        filename: str = "full-ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
         **kwargs
     ):
         super().__init__(

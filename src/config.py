@@ -87,6 +87,11 @@ class TrainingConfig:
     TEST_FILE = _get_config("TEST_FILE", os.path.join(MERGED_DATA_DIR, "test.pkl.lz4"))
     
     VOCAB_PATH = _get_config("VOCAB_PATH", _DEFAULT_VOCAB_PATH)
+    
+    # ========== Tokenizer Configuration ==========
+    TOKENIZER_TYPE = _get_config("TOKENIZER_TYPE", "custom") # "custom" or "nmrmind"
+    VOCAB_NMRMIND_PATH = _get_config("VOCAB_NMRMIND_PATH", "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/vocab_nmrmind.json")
+    
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
     
     # ========== Data Configuration ==========
@@ -135,7 +140,7 @@ class TrainingConfig:
     BATCH_SIZE = _get_config("BATCH_SIZE", 1024)
     TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
     LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
-    EPOCHS = _get_config("EPOCHS", 6000)
+    EPOCHS = _get_config("EPOCHS", 8000)
     GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
     ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
     
@@ -185,14 +190,21 @@ def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):
             sys.path.insert(0, src_path)
         
         # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
-        from tokenizer import RegexSMILESTokenizer
-        
-        vocab_path = config.VOCAB_PATH
-        if not vocab_path:
-            raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
-            
-        logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
-        tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
+        if config.TOKENIZER_TYPE == "nmrmind":
+            from tokenizer_nmrmind import NMRMindTokenizer
+            vocab_path = config.VOCAB_NMRMIND_PATH
+            if not vocab_path:
+                raise ValueError("配置中缺少VOCAB_NMRMIND_PATH参数，无法加载NMRMind tokenizer")
+            logger.info(f"从 {vocab_path} 加载 NMRMindTokenizer")
+            tokenizer = NMRMindTokenizer(vocab_path)
+        else:
+            from tokenizer import RegexSMILESTokenizer
+            vocab_path = config.VOCAB_PATH
+            if not vocab_path:
+                raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
+                
+            logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
+            tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
         
         # Set special token IDs to config
         config.PAD_TOKEN_ID = tokenizer.pad_token_id

@@ -1,11 +1,11 @@
 #!/bin/bash
 
 rjob submit \
-    --name=0112-spec2smi-r9-random-init \
-    --gpu=2 \
+    --name=0108-spec2smi \
+    --gpu=4 \
     --memory=900000 \
-    --cpu=16 \
-    --charged-group=ai4chem_gpu \
+    --cpu=32 \
+    --charged-group=ma4science_gpu \
     --private-machine=group \
     --mount=gpfs://gpfs1/yangzhuo:/mnt/shared-storage-user/yangzhuo \
     --image=registry.h.pjlab.org.cn/ailab-ai4chem-ai4chem_gpu/yangzhuo-cuda121:20251028101900 \

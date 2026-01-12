@@ -36,6 +36,8 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 warnings.filterwarnings("ignore")
 
+torch.set_float32_matmul_precision('high')
+
 # Create log directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
 
@@ -232,6 +234,103 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
     }
 
 
+def nmrmind_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=False):
+    """
+    Collate function for NMRMind tokenizer (Tokenized Spectra).
+    Converts peaks to tokens and creates input_ids directly.
+    """
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+    
+    # 1. SMILES Tokenization (Target)
+    original_smiles_list = [item["original_smiles"] for item in batch]
+    tokenized_smiles = []
+    for smiles in original_smiles_list:
+        tokens = tokenizer.encode_smiles(
+            smiles, 
+            add_special_tokens=True
+        )
+        if len(tokens) > config.MAX_SMILES_LENGTH:
+             tokens = tokens[:config.MAX_SMILES_LENGTH]
+        tokenized_smiles.append(tokens)
+    
+    max_len = max(len(t) for t in tokenized_smiles)
+    padded_smiles = []
+    for tokens in tokenized_smiles:
+        padded = tokens + [tokenizer.pad_token_id] * (max_len - len(tokens))
+        padded_smiles.append(padded)
+    
+    smiles_tensor = torch.tensor(padded_smiles, dtype=torch.long)
+    
+    # 2. Input Tokenization (Spectra -> Tokens)
+    input_ids_list = []
+    
+    for item in batch:
+        # Get raw peaks
+        h_peaks = item.get("h_nmr_peaks")
+        c_peaks = item.get("c_nmr_peaks")
+        
+        # Apply jitter
+        if apply_jitter:
+            if h_peaks is not None and config.NMR_JITTER_RANGE_H > 0:
+                h_peaks = np.array(h_peaks) # Ensure numpy for jitter
+                width = config.NMR_JITTER_RANGE_H
+                jitter = np.random.uniform(-width, width, size=h_peaks.shape)
+                h_peaks = h_peaks + jitter
+                h_peaks = h_peaks.tolist()
+            if c_peaks is not None and config.NMR_JITTER_RANGE_C > 0:
+                c_peaks = np.array(c_peaks)
+                width = config.NMR_JITTER_RANGE_C
+                jitter = np.random.uniform(-width, width, size=c_peaks.shape)
+                c_peaks = c_peaks + jitter
+                c_peaks = c_peaks.tolist()
+        
+        # Encode Spectra
+        input_ids = tokenizer.encode_spectra(c_peaks, h_peaks)
+        
+        # Append Formula if enabled
+        if config.USE_FORMULA_GUIDANCE and "molecular_formula" in item:
+            formula = item["molecular_formula"]
+            if formula:
+                f_start_id = tokenizer.token_to_id.get("<molecular_formula>")
+                f_end_id = tokenizer.token_to_id.get("</molecular_formula>")
+                
+                if f_start_id and f_end_id:
+                    f_tokens = tokenizer.tokenize_smiles(formula) 
+                    f_ids = tokenizer.convert_tokens_to_ids(f_tokens)
+                    input_ids = input_ids + [f_start_id] + f_ids + [f_end_id]
+        
+        input_ids_list.append(input_ids)
+        
+    # Pad Inputs
+    if not input_ids_list:
+        return None
+        
+    max_input_len = max(len(ids) for ids in input_ids_list)
+    padded_input_ids = []
+    attention_masks = []
+    
+    for ids in input_ids_list:
+        pad_len = max_input_len - len(ids)
+        if pad_len < 0: pad_len = 0
+            
+        padded_ids = ids + [tokenizer.pad_token_id] * pad_len
+        mask = [1] * len(ids) + [0] * pad_len
+        padded_input_ids.append(padded_ids)
+        attention_masks.append(mask)
+    
+    input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long)
+    attention_mask_tensor = torch.tensor(attention_masks, dtype=torch.long)
+    
+    return {
+        "smiles": smiles_tensor, # Ground Truth
+        "original_smiles": original_smiles_list,
+        "input_ids": input_ids_tensor,
+        "attention_mask": attention_mask_tensor
+    }
+
+
 def build_dataloaders(config: TrainingConfig, tokenizer):
     """Build data loaders for training and validation with formula guidance."""
     logger.info("Loading datasets...")
@@ -266,16 +365,24 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     else:
         logger.info("❌ 未使用分子式指导")
     
+    # 选择 collate_fn
+    target_collate_fn = peaks_collate_fn
+    if hasattr(config, "TOKENIZER_TYPE") and config.TOKENIZER_TYPE == "nmrmind":
+        target_collate_fn = nmrmind_collate_fn
+        logger.info("Using nmrmind_collate_fn for tokenized spectra input.")
+    else:
+        logger.info("Using peaks_collate_fn for continuous spectra input.")
+
     # 创建带tokenizer和atom_mapping的partial collate函数
     train_collate_fn = partial(
-        peaks_collate_fn,
+        target_collate_fn,
         tokenizer=tokenizer,
         config=config,
         atom_mapping=atom_mapping,
         apply_jitter=getattr(config, "USE_NMR_JITTER", False),
     )
     val_collate_fn = partial(
-        peaks_collate_fn,
+        target_collate_fn,
         tokenizer=tokenizer,
         config=config,
         atom_mapping=atom_mapping,
@@ -414,7 +521,7 @@ def main():
                 "未安装 swanlab，无法启用 SwanLabLogger。请运行 `pip install swanlab` 后重试。"
             )
         except Exception as exc:
-            logger.error(f"SwanLabLogger 初始化失败，将回退到默认日志器: {exc}")
+            logger.error(f"SwanLabLogger 初始化失败，s将回退到默认日志器: {exc}")
             pl_logger = True
 
     trainer = pl.Trainer(
