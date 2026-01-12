@@ -919,8 +919,22 @@ class NMR2SMILESModel(pl.LightningModule):
         if tokens is None or len(tokens) == 0:
             return ""
         if isinstance(tokens, torch.Tensor):
-            tokens = tokens.cpu().numpy()
+            tokens = tokens.cpu().numpy().tolist()
+        elif hasattr(tokens, 'tolist'):
+            tokens = tokens.tolist()
+        else:
+            tokens = list(tokens)
         
+        # Try using tokenizer's decode method if available (NMRMind has this)
+        if hasattr(self.tokenizer, 'decode'):
+            try:
+                smiles = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                smiles = re.sub(r"\s+", "", smiles)
+                return smiles
+            except Exception:
+                pass  # Fallback to manual method
+        
+        # Manual conversion for legacy tokenizer
         token_strings: List[str] = []
         found_eos = False
         

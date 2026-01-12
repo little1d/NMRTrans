@@ -1,10 +1,10 @@
 #!/bin/bash
 
 rjob submit \
-    --name=0112-spec2smi-r9-random-init \
-    --gpu=2 \
+    --name=0112-spec2smi-r11 \
+    --gpu=8 \
     --memory=900000 \
-    --cpu=16 \
+    --cpu=64 \
     --charged-group=ai4chem_gpu \
     --private-machine=group \
     --mount=gpfs://gpfs1/yangzhuo:/mnt/shared-storage-user/yangzhuo \
