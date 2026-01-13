@@ -44,7 +44,7 @@ class PeakEncoder(nn.Module):
             nhead=n_heads,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,  # Pre-LN: 在残差相加前进行归一化，梯度更稳定
+            # norm_first=True,  # Pre-LN: 在残差相加前进行归一化，梯度更稳定
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
@@ -660,6 +660,13 @@ class NMR2SMILESModel(pl.LightningModule):
                     input_ids=gen_input_ids,
                     attention_mask=gen_attention_mask,
                 )
+                
+                # Debug: Log raw token IDs and first few tokens
+                if generated is not None and len(generated) > 0:
+                    raw_ids = generated[0].cpu().numpy().tolist() if hasattr(generated[0], 'cpu') else list(generated[0])
+                    logger.info(f"DEBUG: Raw token IDs (first 20): {raw_ids[:20]}")
+                    logger.info(f"DEBUG: Token count: {len(raw_ids)}")
+                
                 generated_smiles = self.tokens_to_smiles(generated[0])
                 original_smiles = original_smiles_list[0]
                 
