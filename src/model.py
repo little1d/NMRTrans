@@ -8,6 +8,7 @@ import torch.optim as optim
 import pytorch_lightning as pl
 from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
+import math
 
 logger = logging.getLogger(__name__)
 from rdkit import Chem, DataStructs, rdBase
@@ -18,6 +19,237 @@ from rdkit.Chem import AllChem
 # ===========================================================
 # 1. PeakEncoder —— 用于 H-NMR 与 C-NMR（输入 list[float]）
 # ===========================================================
+
+class MAB(nn.Module):
+    """Multihead Attention Block"""
+    def __init__(self, dim_Q, dim_K, dim_V, num_heads, dropout=0.1):
+        super().__init__()
+        self.dim_V = dim_V
+        self.num_heads = num_heads
+        self.dropout = nn.Dropout(dropout)
+        
+        self.fc_q = nn.Linear(dim_Q, dim_V)
+        self.fc_k = nn.Linear(dim_K, dim_V)
+        self.fc_v = nn.Linear(dim_K, dim_V)
+        self.fc_o = nn.Linear(dim_V, dim_V)
+        
+        self.ln1 = nn.LayerNorm(dim_V)
+        self.ln2 = nn.LayerNorm(dim_V)
+        
+    def forward(self, Q, K, mask=None):
+        Q = self.ln1(Q)
+        K = self.ln1(K)
+        
+        q = self.fc_q(Q).view(Q.size(0), Q.size(1), self.num_heads, self.dim_V // self.num_heads)
+        k = self.fc_k(K).view(K.size(0), K.size(1), self.num_heads, self.dim_V // self.num_heads)
+        v = self.fc_v(K).view(K.size(0), K.size(1), self.num_heads, self.dim_V // self.num_heads)
+        
+        q = q.permute(0, 2, 1, 3)  # (B, H, Lq, D/H)
+        k = k.permute(0, 2, 3, 1)  # (B, H, D/H, Lk)
+        v = v.permute(0, 2, 1, 3)  # (B, H, Lk, D/H)
+        
+        att = torch.matmul(q, k) / math.sqrt(self.dim_V // self.num_heads)
+        
+        if mask is not None:
+            # mask: (B, Lk) -> (B, 1, 1, Lk)
+            mask = mask.unsqueeze(1).unsqueeze(1)
+            att = att.masked_fill(mask == 0, -1e9)
+        
+        att = torch.softmax(att, dim=-1)
+        att = self.dropout(att)
+        
+        out = torch.matmul(att, v)  # (B, H, Lq, D/H)
+        out = out.permute(0, 2, 1, 3).contiguous()  # (B, Lq, H, D/H)
+        out = out.view(out.size(0), out.size(1), self.dim_V)  # (B, Lq, D)
+        
+        out = self.fc_o(out)
+        out = self.ln2(Q + self.dropout(out))
+        
+        return out
+
+class SAB(nn.Module):
+    """Self-Attention Block"""
+    def __init__(self, dim_in, dim_out, num_heads, dropout=0.1):
+        super().__init__()
+        self.mab = MAB(dim_in, dim_in, dim_out, num_heads, dropout)
+    
+    def forward(self, X, mask=None):
+        return self.mab(X, X, mask)
+
+class ISAB(nn.Module):
+    """Induced Self-Attention Block"""
+    def __init__(self, dim_in, dim_out, num_heads, num_inds, dropout=0.1):
+        super().__init__()
+        self.num_inds = num_inds
+        self.I = nn.Parameter(torch.randn(1, num_inds, dim_out))
+        self.mab1 = MAB(dim_out, dim_in, dim_out, num_heads, dropout)
+        self.mab2 = MAB(dim_in, dim_out, dim_out, num_heads, dropout)
+    
+    def forward(self, X, mask=None):
+        batch_size = X.size(0)
+        I = self.I.expand(batch_size, -1, -1)
+        H = self.mab1(I, X, mask)  # (B, num_inds, dim_out)
+        return self.mab2(X, H)     # (B, L, dim_out)
+
+class PMA(nn.Module):
+    """Pooling by Multihead Attention"""
+    def __init__(self, dim, num_heads, num_seeds, dropout=0.1):
+        super().__init__()
+        self.S = nn.Parameter(torch.randn(1, num_seeds, dim))
+        self.mab = MAB(dim, dim, dim, num_heads, dropout)
+    
+    def forward(self, X, mask=None):
+        batch_size = X.size(0)
+        S = self.S.expand(batch_size, -1, -1)
+        return self.mab(S, X, mask)
+
+class SetTransformerPeakEncoder(nn.Module):
+    """
+    Set Transformer Encoder for NMR peaks with configurable number of layers
+    输入: (B, L, 1) 的归一化ppm序列（包含重复，重复次数表示强度）
+    输出: (B, L_unique, d_model) 的峰特征编码
+    
+    核心优势:
+    - 天然支持无序集合输入
+    - 置换不变性（permutation-invariant）
+    - 支持任意层数的ISAB编码
+    """
+    def __init__(self, d_model=512, n_heads=8, num_inds=32, num_seeds=16, 
+                 n_layers=3, ff_dim=1024, dropout=0.1, max_peaks=60):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.max_peaks = max_peaks
+        self.n_layers = n_layers
+        
+        # 1. 输入投影层：将[ppm, intensity]投影到d_model维度
+        self.input_proj = nn.Sequential(
+            nn.Linear(2, d_model // 2),
+            nn.ReLU(),
+            nn.LayerNorm(d_model // 2),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model)
+        )
+        
+        # 2. ISAB层（可配置层数）
+        self.isab_layers = nn.ModuleList()
+        for i in range(n_layers):
+            self.isab_layers.append(
+                ISAB(d_model, d_model, n_heads, num_inds, dropout)
+            )
+        
+        # 3. PMA层（可选，用于提取全局表示）
+        self.pma = PMA(d_model, n_heads, num_seeds, dropout)
+        
+        # 4. 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model)
+        )
+        
+        # 5. 用于padding的可学习token
+        self.pad_token = nn.Parameter(torch.randn(1, 1, d_model))
+    
+    def _process_peaks(self, peaks, mask):
+        """
+        将归一化后的peaks转换为(unique_ppm, intensities)
+        peaks: (B, L, 1) - 归一化的ppm值，包含重复
+        mask: (B, L) - 1表示有效峰，0表示padding
+        
+        返回:
+            unique_ppm: (B, L_unique) - 唯一的归一化ppm值
+            intensities: (B, L_unique) - 对应的强度（重复次数）
+            valid_mask: (B, L_unique) - 1表示有效峰，0表示padding
+        """
+        batch_size, max_len, _ = peaks.shape
+        device = peaks.device
+        
+        # 初始化输出张量
+        max_unique_peaks = self.max_peaks
+        unique_ppm = torch.zeros(batch_size, max_unique_peaks, device=device)
+        intensities = torch.zeros(batch_size, max_unique_peaks, device=device)
+        valid_mask = torch.zeros(batch_size, max_unique_peaks, device=device, dtype=torch.bool)
+        
+        for i in range(batch_size):
+            # 获取当前样本的有效峰（根据mask）
+            valid_indices = mask[i].bool()
+            if not valid_indices.any():
+                continue
+                
+            batch_peaks = peaks[i, valid_indices, 0]  # (num_valid_peaks,)
+            
+            # 将归一化ppm转换为字符串以便统计（避免浮点精度问题）
+            rounded_peaks = torch.round(batch_peaks * 10000) / 10000.0
+            
+            # 统计每个ppm值的出现次数（强度）
+            unique_vals, counts = torch.unique(rounded_peaks, return_counts=True, sorted=False)
+            
+            # 按ppm值排序（从大到小，符合NMR习惯）
+            sort_indices = torch.argsort(unique_vals, descending=True)
+            unique_vals = unique_vals[sort_indices]
+            counts = counts[sort_indices]
+            
+            # 限制最大峰数
+            num_peaks_to_use = min(len(unique_vals), max_unique_peaks)
+            
+            # 填充unique_ppm和intensities
+            unique_ppm[i, :num_peaks_to_use] = unique_vals[:num_peaks_to_use]
+            intensities[i, :num_peaks_to_use] = counts[:num_peaks_to_use].float()
+            valid_mask[i, :num_peaks_to_use] = True
+        
+        return unique_ppm, intensities, valid_mask
+    
+    def forward(self, peaks, mask=None):
+        """
+        peaks: (B, L, 1) - 归一化的ppm序列，包含重复（重复次数=强度）
+        mask: (B, L) - 1表示有效峰，0表示padding
+        
+        返回: (B, L_unique, d_model) - 峰特征编码
+        """
+        if peaks is None:
+            return None
+            
+        # 兼容性修复：如果输入是 (B, L) 二维张量，则扩展为 (B, L, 1)
+        if peaks.dim() == 2:
+            peaks = peaks.unsqueeze(-1)
+            
+        if mask is None:
+            # 如果没有提供mask，根据peaks是否为0创建mask
+            mask = (peaks.abs() > 1e-6).all(-1).long()
+        
+        # 1. 预处理：将归一化peaks转换为(unique_ppm, intensities)对
+        unique_ppm, intensities, valid_mask = self._process_peaks(peaks, mask)
+        # unique_ppm shape: (B, L_unique) - 已归一化的ppm值 [0,1]
+        # intensities shape: (B, L_unique) - 强度值
+        
+        batch_size, num_unique_peaks = unique_ppm.shape
+        
+        # 2. 创建输入特征: [ppm, intensity]
+        features = torch.stack([unique_ppm, intensities], dim=-1)  # (B, L_unique, 2)
+        
+        # 3. 输入投影
+        X = self.input_proj(features)  # (B, L_unique, d_model)
+        
+        # 4. 应用mask：将padding位置替换为pad_token
+        pad_mask = ~valid_mask  # True表示需要padding的位置
+        if pad_mask.any():
+            pad_tokens = self.pad_token.expand(batch_size, num_unique_peaks, -1)
+            X = torch.where(pad_mask.unsqueeze(-1), pad_tokens, X)
+        
+        # 5. Set Transformer编码（多层ISAB）
+        for i, isab_layer in enumerate(self.isab_layers):
+            X = isab_layer(X, mask=pad_mask if pad_mask.any() else None)
+        
+        # 6. （可选）PMA获取全局表示
+        # global_repr = self.pma(X, mask=pad_mask if pad_mask.any() else None)  # (B, num_seeds, d_model)
+        
+        # 7. 输出投影
+        X = self.output_proj(X)  # (B, L_unique, d_model)
+        
+        return X
 
 class PeakEncoder(nn.Module):
     """
@@ -224,7 +456,7 @@ class NMR2SMILESModel(pl.LightningModule):
         
         # 主模态 encoder（根据配置初始化）
         if use_c_nmr:
-            self.c_encoder = PeakEncoder(
+            self.c_encoder = SetTransformerPeakEncoder(
                 d_model=d_model,
                 n_layers=config.PEAK_ENCODER_N_LAYERS,
                 n_heads=config.PEAK_ENCODER_N_HEADS,
@@ -238,7 +470,7 @@ class NMR2SMILESModel(pl.LightningModule):
             logger.info("❌ C-NMR encoder 已禁用（消融实验）")
         
         if use_h_nmr:
-            self.h_encoder = PeakEncoder(
+            self.h_encoder = SetTransformerPeakEncoder(
                 d_model=d_model,
                 n_layers=config.PEAK_ENCODER_N_LAYERS,
                 n_heads=config.PEAK_ENCODER_N_HEADS,
@@ -521,10 +753,14 @@ class NMR2SMILESModel(pl.LightningModule):
             if Chem.MolToSmiles(pred_mol) == Chem.MolToSmiles(origin_mol):
                 acc = 1.0
             
-            # Tanimoto Similarity
-            fp_1 = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048, useChirality=True)
-            fp_2 = AllChem.GetMorganFingerprintAsBitVect(origin_mol, 2, nBits=2048, useChirality=True)
-            similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
+            # Tanimoto Similarity (suppress deprecation warnings)
+            rdBase.DisableLog('rdApp.warning')
+            try:
+                fp_1 = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048, useChirality=True)
+                fp_2 = AllChem.GetMorganFingerprintAsBitVect(origin_mol, 2, nBits=2048, useChirality=True)
+                similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
+            finally:
+                rdBase.EnableLog('rdApp.warning')
             
         except Exception as e:
             # logger.warning(f"RDKit evaluation error: {e}")
@@ -660,12 +896,6 @@ class NMR2SMILESModel(pl.LightningModule):
                     input_ids=gen_input_ids,
                     attention_mask=gen_attention_mask,
                 )
-                
-                # Debug: Log raw token IDs and first few tokens
-                if generated is not None and len(generated) > 0:
-                    raw_ids = generated[0].cpu().numpy().tolist() if hasattr(generated[0], 'cpu') else list(generated[0])
-                    logger.info(f"DEBUG: Raw token IDs (first 20): {raw_ids[:20]}")
-                    logger.info(f"DEBUG: Token count: {len(raw_ids)}")
                 
                 generated_smiles = self.tokens_to_smiles(generated[0])
                 original_smiles = original_smiles_list[0]
