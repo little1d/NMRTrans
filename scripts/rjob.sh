@@ -1,7 +1,7 @@
 #!/bin/bash
 
 rjob submit \
-    --name=0115-spec2smi \
+    --name=0115-spec2smi-recons \
     --gpu=8 \
     --memory=1200000 \
     --cpu=32 \

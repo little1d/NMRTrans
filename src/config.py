@@ -89,9 +89,6 @@ class TrainingConfig:
     VOCAB_PATH = _get_config("VOCAB_PATH", _DEFAULT_VOCAB_PATH)
     
     # ========== Tokenizer Configuration ==========
-    TOKENIZER_TYPE = _get_config("TOKENIZER_TYPE", "custom") # "custom" or "nmrmind"
-    VOCAB_NMRMIND_PATH = _get_config("VOCAB_NMRMIND_PATH", "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/vocab_nmrmind.json")
-    
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
     
     # ========== Data Configuration ==========
@@ -190,21 +187,14 @@ def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):
             sys.path.insert(0, src_path)
         
         # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
-        if config.TOKENIZER_TYPE == "nmrmind":
-            from tokenizer_nmrmind import NMRMindTokenizer
-            vocab_path = config.VOCAB_NMRMIND_PATH
-            if not vocab_path:
-                raise ValueError("配置中缺少VOCAB_NMRMIND_PATH参数，无法加载NMRMind tokenizer")
-            logger.info(f"从 {vocab_path} 加载 NMRMindTokenizer")
-            tokenizer = NMRMindTokenizer(vocab_path)
-        else:
-            from tokenizer import RegexSMILESTokenizer
-            vocab_path = config.VOCAB_PATH
-            if not vocab_path:
-                raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
-                
-            logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
-            tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
+        # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
+        from tokenizer import RegexSMILESTokenizer
+        vocab_path = config.VOCAB_PATH
+        if not vocab_path:
+            raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
+            
+        logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
+        tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
         
         # Set special token IDs to config
         config.PAD_TOKEN_ID = tokenizer.pad_token_id

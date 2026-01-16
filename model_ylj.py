@@ -9,12 +9,11 @@ import pytorch_lightning as pl
 from transformers import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 import math
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 from rdkit import Chem, DataStructs, rdBase
 from rdkit.Chem import AllChem
-
-
 
 # ===========================================================
 # 1. PeakEncoder —— 用于 H-NMR 与 C-NMR（输入 list[float]）
@@ -212,10 +211,6 @@ class SetTransformerPeakEncoder(nn.Module):
         if peaks is None:
             return None
             
-        # 兼容性修复：如果输入是 (B, L) 二维张量，则扩展为 (B, L, 1)
-        if peaks.dim() == 2:
-            peaks = peaks.unsqueeze(-1)
-            
         if mask is None:
             # 如果没有提供mask，根据peaks是否为0创建mask
             mask = (peaks.abs() > 1e-6).all(-1).long()
@@ -251,6 +246,178 @@ class SetTransformerPeakEncoder(nn.Module):
         
         return X
 
+class ModifiedPeakEncoder(nn.Module):
+    """
+    输入: (B, L, 1) 的归一化ppm序列（包含重复，重复次数表示强度）
+    输出: (B, L_unique, d_model) 的峰特征编码
+    
+    核心设计：
+    - 归一化的ppm值 → 通过可学习MLP生成位置编码
+    - 重复次数 → 作为值信息（强度）
+    - 完全移除基于索引的peak_order_embedding
+    """
+    def __init__(self, d_model=512, n_layers=3, n_heads=8, ff_dim=1024, dropout=0.1, 
+                 max_peaks=60, is_proton=True):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.max_peaks = max_peaks
+        self.is_proton = is_proton
+        
+        # 1. 可学习的位置编码器 (替代正弦/余弦编码)
+        self.position_encoder = nn.Sequential(
+            nn.Linear(1, d_model // 2),    # 输入: [ppm]
+            nn.GELU(),
+            nn.LayerNorm(d_model // 2),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model)  # 输出: (B, L_unique, d_model)
+        )
+        
+        # 2. 强度投影层 (将强度值投影到d_model维度)
+        self.intensity_proj = nn.Sequential(
+            nn.Linear(1, d_model // 2),
+            nn.ReLU(),
+            nn.LayerNorm(d_model // 2),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model)
+        )
+        
+        # 3. Transformer编码器
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            dim_feedforward=ff_dim,
+            nhead=n_heads,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # 4. LayerNorm
+        self.norm = nn.LayerNorm(d_model)
+        
+        # 5. 用于padding的可学习token
+        self.pad_token = nn.Parameter(torch.randn(1, 1, d_model))
+        
+        # 6. Dropout
+        self.dropout = nn.Dropout(dropout)
+    
+    def _learnable_positional_encoding(self, normalized_ppm):
+        """
+        可学习的位置编码生成器
+        normalized_ppm: (B, L_unique) - 已归一化的ppm值 [0, 1]
+        返回: (B, L_unique, d_model) 的位置编码
+        """
+        batch_size, seq_len = normalized_ppm.shape
+        device = normalized_ppm.device
+        
+        # 将ppm值重塑为 (B*L_unique, 1) 以便通过MLP
+        ppm_flat = normalized_ppm.view(-1, 1)  # (B*L_unique, 1)
+        
+        # 通过可学习的MLP
+        pos_enc_flat = self.position_encoder(ppm_flat)  # (B*L_unique, d_model)
+        
+        # 重塑回 (B, L_unique, d_model)
+        pos_enc = pos_enc_flat.view(batch_size, seq_len, self.d_model)
+        
+        return pos_enc
+    
+    def _process_peaks(self, peaks, mask):
+        """
+        将归一化后的peaks转换为(unique_ppm, intensities)
+        peaks: (B, L, 1) - 归一化的ppm值，包含重复
+        mask: (B, L) - 1表示有效峰，0表示padding
+        
+        返回:
+            unique_ppm: (B, L_unique) - 唯一的归一化ppm值
+            intensities: (B, L_unique) - 对应的强度（重复次数）
+            valid_mask: (B, L_unique) - 1表示有效峰，0表示padding
+        """
+        batch_size, max_len, _ = peaks.shape
+        device = peaks.device
+        
+        # 初始化输出张量
+        max_unique_peaks = self.max_peaks
+        unique_ppm = torch.zeros(batch_size, max_unique_peaks, device=device)
+        intensities = torch.zeros(batch_size, max_unique_peaks, device=device)
+        valid_mask = torch.zeros(batch_size, max_unique_peaks, device=device, dtype=torch.bool)
+        
+        for i in range(batch_size):
+            # 获取当前样本的有效峰（根据mask）
+            valid_indices = mask[i].bool()
+            if not valid_indices.any():
+                continue
+                
+            batch_peaks = peaks[i, valid_indices, 0]  # (num_valid_peaks,)
+            
+            # 将归一化ppm转换为字符串以便统计（避免浮点精度问题）
+            rounded_peaks = torch.round(batch_peaks * 10000) / 10000.0
+            
+            # 统计每个ppm值的出现次数（强度）
+            unique_vals, counts = torch.unique(rounded_peaks, return_counts=True, sorted=False)
+            
+            # 按ppm值排序（从大到小，符合NMR习惯）
+            sort_indices = torch.argsort(unique_vals, descending=True)
+            unique_vals = unique_vals[sort_indices]
+            counts = counts[sort_indices]
+            
+            # 限制最大峰数
+            num_peaks_to_use = min(len(unique_vals), max_unique_peaks)
+            
+            # 填充unique_ppm和intensities
+            unique_ppm[i, :num_peaks_to_use] = unique_vals[:num_peaks_to_use]
+            intensities[i, :num_peaks_to_use] = counts[:num_peaks_to_use].float()
+            valid_mask[i, :num_peaks_to_use] = True
+        
+        return unique_ppm, intensities, valid_mask
+    
+    def forward(self, peaks, mask=None):
+        """
+        peaks: (B, L, 1) - 归一化的ppm序列，包含重复（重复次数=强度）
+        mask: (B, L) - 1表示有效峰，0表示padding
+        
+        返回: (B, L_unique, d_model) - 峰特征编码
+        """
+        if peaks is None:
+            return None
+            
+        if mask is None:
+            # 如果没有提供mask，根据peaks是否为0创建mask
+            mask = (peaks.abs() > 1e-6).all(-1).long()
+        
+        # 1. 预处理：将归一化peaks转换为(unique_ppm, intensities)对
+        unique_ppm, intensities, valid_mask = self._process_peaks(peaks, mask)
+        # unique_ppm shape: (B, L_unique) - 已归一化的ppm值 [0,1]
+        # intensities shape: (B, L_unique) - 强度值
+        
+        batch_size, num_unique_peaks = unique_ppm.shape
+        
+        # 2. 为强度创建输入张量
+        intensity_input = intensities.unsqueeze(-1)  # (B, L_unique, 1)
+        
+        # 3. 强度投影
+        x = self.intensity_proj(intensity_input)  # (B, L_unique, d_model)
+        
+        # 4. 可学习的位置编码（使用归一化后的ppm值）
+        pos_enc = self._learnable_positional_encoding(unique_ppm)  # (B, L_unique, d_model)
+        x = x + pos_enc
+        x = self.dropout(x)
+        
+        # 5. 应用mask：将padding位置替换为pad_token
+        pad_mask = ~valid_mask  # True表示需要padding的位置
+        if pad_mask.any():
+            pad_tokens = self.pad_token.expand(batch_size, num_unique_peaks, -1)
+            x = torch.where(pad_mask.unsqueeze(-1), pad_tokens, x)
+        
+        # 6. Transformer编码
+        transformer_mask = pad_mask  # True表示padding位置，在Transformer中会被忽略
+        x = self.transformer(x, src_key_padding_mask=transformer_mask if transformer_mask.any() else None)
+        
+        # 7. LayerNorm
+        x = self.norm(x)
+        
+        return x
+
 class PeakEncoder(nn.Module):
     """
     输入: (B, L) 的 ppm list → 输出: (B, L, d_model) 的峰序列编码
@@ -269,14 +436,13 @@ class PeakEncoder(nn.Module):
         # 3. 输入 LayerNorm
         self.input_norm = nn.LayerNorm(d_model)
         
-        # 4. Transformer 编码器（带 dropout，使用 Pre-LN 提升梯度稳定性）
+        # 4. Transformer 编码器（带 dropout）
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             dim_feedforward=ff_dim,
             nhead=n_heads,
             dropout=dropout,
             batch_first=True,
-            # norm_first=True,  # Pre-LN: 在残差相加前进行归一化，梯度更稳定
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
@@ -548,6 +714,7 @@ class NMR2SMILESModel(pl.LightningModule):
         formula=None,
         smiles_ids=None,
         attention_mask=None,
+        input_ids=None,  # Added for tokenized spectra
         formula_vector=None,
         c_nmr_mask=None,
         h_nmr_mask=None,
@@ -558,60 +725,73 @@ class NMR2SMILESModel(pl.LightningModule):
           c_peaks: List[List[float]] → 已 padded tensor
           h_peaks: 同上
           smiles_ids: tokenized smiles (labels)
+          input_ids: Tokenized spectra (for NMRMind mode)
         """
         
-        # C-NMR（根据配置和输入决定）
-        z_c = None
-        if self.c_encoder is not None and c_peaks is not None:
-            z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
-
-        # H-NMR（根据配置和输入决定）
-        z_h = None
-        if self.h_encoder is not None and h_peaks is not None:
-            z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
-
-        # 新增：处理化学式guidance
-        z_guidance = None
-        if self.formula_encoder is not None and formula_vector is not None:
-            z_guidance = self.formula_encoder(formula_vector)  # (B, 1, d_model)
-        
-        # 融合
-        encoder_hidden = self.fusion(z_c, z_h, z_guidance)  # (B, L_total, d_model)
-
-        # 构造 encoder_outputs（跳过 T5 encoder）
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
-
-        # Create encoder attention mask for the peak sequence
-        # encoder_hidden: (B, L, d_model) where L = num_c_peaks + num_h_peaks (+ formula)
-        batch_size, seq_len, _ = encoder_hidden.shape
-
-        mask_list = []
-        if c_nmr_mask is not None:
-            mask_list.append(c_nmr_mask)
-        if h_nmr_mask is not None:
-            mask_list.append(h_nmr_mask)
-
-        if len(mask_list) > 0:
-            encoder_attention_mask = torch.cat(mask_list, dim=1)
-            if z_guidance is not None:
-                formula_mask = torch.ones(batch_size, 1, dtype=torch.long, device=encoder_attention_mask.device)
-                encoder_attention_mask = torch.cat([encoder_attention_mask, formula_mask], dim=1)
+        # 1. 如果提供了 input_ids，直接使用 T5 encoder（NMRMind 模式）
+        if input_ids is not None:
+            # T5 encoder 接受 input_ids 和 attention_mask
+            encoder_outputs = self.t5.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+            # encoder_outputs 是 BaseModelOutput
         else:
-            # Fallback: no masks provided
-            encoder_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
+            # 2. 否则使用 PeakEncoder + Fusion（原始模式）
+            
+            # C-NMR（根据配置和输入决定）
+            z_c = None
+            if self.c_encoder is not None and c_peaks is not None:
+                z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
 
-        if encoder_attention_mask.shape[1] != seq_len:
-            if encoder_attention_mask.shape[1] > seq_len:
-                encoder_attention_mask = encoder_attention_mask[:, :seq_len]
+            # H-NMR（根据配置和输入决定）
+            z_h = None
+            if self.h_encoder is not None and h_peaks is not None:
+                z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
+
+            # 新增：处理化学式guidance
+            z_guidance = None
+            if self.formula_encoder is not None and formula_vector is not None:
+                z_guidance = self.formula_encoder(formula_vector)  # (B, 1, d_model)
+            
+            # 融合
+            encoder_hidden = self.fusion(z_c, z_h, z_guidance)  # (B, L_total, d_model)
+
+            # 构造 encoder_outputs（跳过 T5 encoder）
+            encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
+
+            # Create encoder attention mask for the peak sequence
+            # encoder_hidden: (B, L, d_model) where L = num_c_peaks + num_h_peaks (+ formula)
+            batch_size, seq_len, _ = encoder_hidden.shape
+
+            mask_list = []
+            if c_nmr_mask is not None:
+                mask_list.append(c_nmr_mask)
+            if h_nmr_mask is not None:
+                mask_list.append(h_nmr_mask)
+
+            if len(mask_list) > 0:
+                encoder_attention_mask = torch.cat(mask_list, dim=1)
+                if z_guidance is not None:
+                    formula_mask = torch.ones(batch_size, 1, dtype=torch.long, device=encoder_attention_mask.device)
+                    encoder_attention_mask = torch.cat([encoder_attention_mask, formula_mask], dim=1)
             else:
-                padding = torch.zeros(
-                    batch_size, seq_len - encoder_attention_mask.shape[1],
-                    dtype=torch.long, device=encoder_attention_mask.device
-                )
-                encoder_attention_mask = torch.cat([encoder_attention_mask, padding], dim=1)
-        
-        # Use the constructed mask
-        attention_mask = encoder_attention_mask
+                # Fallback: no masks provided
+                encoder_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=encoder_hidden.device)
+
+            if encoder_attention_mask.shape[1] != seq_len:
+                if encoder_attention_mask.shape[1] > seq_len:
+                    encoder_attention_mask = encoder_attention_mask[:, :seq_len]
+                else:
+                    padding = torch.zeros(
+                        batch_size, seq_len - encoder_attention_mask.shape[1],
+                        dtype=torch.long, device=encoder_attention_mask.device
+                    )
+                    encoder_attention_mask = torch.cat([encoder_attention_mask, padding], dim=1)
+            
+            # Use the constructed mask
+            attention_mask = encoder_attention_mask
 
         # 送入 T5 decoder
         outputs = self.t5(
@@ -643,6 +823,9 @@ class NMR2SMILESModel(pl.LightningModule):
         
         formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
 
+        input_ids = batch.get("input_ids") # Check for input_ids
+        attention_mask = batch.get("attention_mask")
+
         # Forward pass
         outputs = self(
             c_peaks=c_peaks,
@@ -651,6 +834,8 @@ class NMR2SMILESModel(pl.LightningModule):
             smiles_ids=labels,
             c_nmr_mask=c_nmr_mask,
             h_nmr_mask=h_nmr_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
         )
         
         loss = outputs.loss
@@ -734,14 +919,10 @@ class NMR2SMILESModel(pl.LightningModule):
             if Chem.MolToSmiles(pred_mol) == Chem.MolToSmiles(origin_mol):
                 acc = 1.0
             
-            # Tanimoto Similarity (suppress deprecation warnings)
-            rdBase.DisableLog('rdApp.warning')
-            try:
-                fp_1 = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048, useChirality=True)
-                fp_2 = AllChem.GetMorganFingerprintAsBitVect(origin_mol, 2, nBits=2048, useChirality=True)
-                similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
-            finally:
-                rdBase.EnableLog('rdApp.warning')
+            # Tanimoto Similarity
+            fp_1 = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048, useChirality=True)
+            fp_2 = AllChem.GetMorganFingerprintAsBitVect(origin_mol, 2, nBits=2048, useChirality=True)
+            similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
             
         except Exception as e:
             # logger.warning(f"RDKit evaluation error: {e}")
@@ -769,6 +950,9 @@ class NMR2SMILESModel(pl.LightningModule):
         # Teacher forcing evaluation
         labels = smiles_ids.clone()
         labels[labels == self.config.PAD_TOKEN_ID] = -100
+        
+        input_ids = batch.get("input_ids")
+        attention_mask = batch.get("attention_mask")
 
         with torch.no_grad():
             outputs = self(
@@ -778,6 +962,8 @@ class NMR2SMILESModel(pl.LightningModule):
                 smiles_ids=labels,
                 c_nmr_mask=c_nmr_mask,
                 h_nmr_mask=h_nmr_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
             
             logits = outputs.logits
@@ -807,6 +993,7 @@ class NMR2SMILESModel(pl.LightningModule):
             generated_ids = self.generate(
                 c_peaks, h_peaks, formula_vector, 
                 c_nmr_mask=c_nmr_mask, h_nmr_mask=h_nmr_mask,
+                input_ids=input_ids, attention_mask=attention_mask, # Pass tokenized inputs
                 max_length=self.config.MAX_SMILES_LENGTH + 5,
                 num_beams=1, # Greedy decoding for validation speed
                 do_sample=False
@@ -858,6 +1045,9 @@ class NMR2SMILESModel(pl.LightningModule):
                 gen_formula = formula_vector[:1] if formula_vector is not None else None
                 gen_c_mask = c_nmr_mask[:1] if c_nmr_mask is not None else None
                 gen_h_mask = h_nmr_mask[:1] if h_nmr_mask is not None else None
+                
+                gen_input_ids = input_ids[:1] if input_ids is not None else None
+                gen_attention_mask = attention_mask[:1] if attention_mask is not None else None
 
                 generated = self.generate(
                     gen_c_peaks,
@@ -865,8 +1055,9 @@ class NMR2SMILESModel(pl.LightningModule):
                     gen_formula,
                     c_nmr_mask=gen_c_mask,
                     h_nmr_mask=gen_h_mask,
+                    input_ids=gen_input_ids,
+                    attention_mask=gen_attention_mask,
                 )
-                
                 generated_smiles = self.tokens_to_smiles(generated[0])
                 original_smiles = original_smiles_list[0]
                 
@@ -885,7 +1076,7 @@ class NMR2SMILESModel(pl.LightningModule):
         
         return {"val_token_acc": token_acc, "val_seq_acc": seq_acc}
     
-    def generate(self, c_peaks=None, h_peaks=None, formula_vector=None, max_length=None, num_beams=1, 
+    def generate(self, c_peaks=None, h_peaks=None, formula_vector=None, input_ids=None, attention_mask=None, max_length=None, num_beams=1, 
                 do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None,
                 c_nmr_mask=None, h_nmr_mask=None, **generate_kwargs):
         """
@@ -909,119 +1100,174 @@ class NMR2SMILESModel(pl.LightningModule):
         if max_length is None:
             max_length = self.config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS
             
-        # 检查 Peak Input (根据配置)
+        # 1. 优先处理 Tokenized Input (NMRMind)
+        if input_ids is not None:
+            # Use T5 encoder directly
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            
+            # Ensure input_ids on device
+            input_ids = input_ids.to(self.device if hasattr(self, 'device') else input_ids.device)
+            attention_mask = attention_mask.to(input_ids.device)
+            
+            # Encoder forward
+            encoder_outputs = self.t5.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+            
+            # Prepare for generation (Batch size etc)
+            batch_size_actual = input_ids.shape[0]
+            seq_len = input_ids.shape[1]
+            
+            # Skip PeakEncoder logic and go directly to generation
+            # We need to construct mask_list or just use attention_mask for decoder
+            # In T5 generation, attention_mask is used for encoder_outputs usually.
+            
+            # Do Common Generation
+            try:
+                generated_ids = self.t5.generate(
+                    encoder_outputs=encoder_outputs,
+                    attention_mask=attention_mask,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    pad_token_id=self.config.PAD_TOKEN_ID,
+                    eos_token_id=self.config.EOS_TOKEN_ID,
+                    bos_token_id=self.config.BOS_TOKEN_ID,
+                    **generate_kwargs,
+                )
+                return generated_ids
+            except Exception as e:
+                logger.error(f"T5 generation with input_ids failed: {str(e)}")
+                raise e
+        
+        # 2. 检查 Legacy Peak Input (根据配置)
         has_c = self.c_encoder is not None and c_peaks is not None
         has_h = self.h_encoder is not None and h_peaks is not None
         has_nmr = has_c or has_h
         
         if not has_nmr:
-            logger.error("Generate Check Failed: No NMR modality provided")
+            logger.error("Legacy Generate Check Failed: No NMR modality provided")
             raise ValueError(
-                "至少需要提供一个NMR模态（C或H）："
+                "至少需要提供一个NMR模态（C或H），或者提供 input_ids："
                 f"C-NMR (enabled={self.c_encoder is not None}, provided={c_peaks is not None}), "
                 f"H-NMR (enabled={self.h_encoder is not None}, provided={h_peaks is not None})"
             )
             
-        # 确定设备
-        device = next(self.parameters()).device
+        # ... Legacy Logic follows ...
+
+        # ---------------------------------------------------------
+        # Original Generation Logic (adapted)
+        # ---------------------------------------------------------
         
-        # 处理单个样本情况（添加批次维度）
-        # 优先从启用的NMR模态确定batch_size
-        if batch_size is None:
-            # 优先从C-NMR确定
+            
+        # If no input_ids provided, run specific encoding logic
+        if input_ids is None:
+            # 确定设备
+            device = next(self.parameters()).device
+            
+            # 处理单个样本情况（添加批次维度）
+            # 优先从启用的NMR模态确定batch_size
+            if batch_size is None:
+                # 优先从C-NMR确定
+                if c_peaks is not None:
+                    if c_peaks.dim() == 1:
+                        c_peaks = c_peaks.unsqueeze(0)
+                    batch_size = c_peaks.shape[0]
+                # 如果C-NMR不可用，从H-NMR确定
+                elif h_peaks is not None:
+                    if h_peaks.dim() == 1:
+                        h_peaks = h_peaks.unsqueeze(0)
+                    batch_size = h_peaks.shape[0]
+                # 如果NMR都不可用（不应该发生，因为前面已验证），从Formula确定
+                elif formula_vector is not None:
+                    if formula_vector.dim() == 1:
+                        formula_vector = formula_vector.unsqueeze(0)
+                    batch_size = formula_vector.shape[0]
+                else:
+                    raise ValueError("无法确定batch_size：所有输入都是None")
+            else:
+                batch_size = batch_size # Explicitly set
+            
+            # 确保所有输入都在正确设备上
             if c_peaks is not None:
-                if c_peaks.dim() == 1:
-                    c_peaks = c_peaks.unsqueeze(0)
-                batch_size = c_peaks.shape[0]
-            # 如果C-NMR不可用，从H-NMR确定
-            elif h_peaks is not None:
-                if h_peaks.dim() == 1:
-                    h_peaks = h_peaks.unsqueeze(0)
-                batch_size = h_peaks.shape[0]
-            # 如果NMR都不可用（不应该发生，因为前面已验证），从Formula确定
-            elif formula_vector is not None:
+                c_peaks = c_peaks.to(device).float()
+            if h_peaks is not None:
+                h_peaks = h_peaks.to(device).float()
+            if formula_vector is not None:
+                formula_vector = formula_vector.to(device).float()
+            if c_nmr_mask is not None:
+                c_nmr_mask = c_nmr_mask.to(device).long()
+            if h_nmr_mask is not None:
+                h_nmr_mask = h_nmr_mask.to(device).long()
+            
+            # 编码NMR数据（根据配置）
+            z_c = None
+            if self.c_encoder is not None and c_peaks is not None:
+                z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
+            
+            z_h = None
+            if self.h_encoder is not None and h_peaks is not None:
+                z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
+            
+            # 编码公式指导
+            z_guidance = None
+            if self.formula_encoder is not None and formula_vector is not None:
+                # 确保formula_vector有正确的形状
                 if formula_vector.dim() == 1:
                     formula_vector = formula_vector.unsqueeze(0)
-                batch_size = formula_vector.shape[0]
-            else:
-                raise ValueError("无法确定batch_size：所有输入都是None")
-        else:
-            batch_size = batch_size # Explicitly set
-        
-        # 确保所有输入都在正确设备上
-        if c_peaks is not None:
-            c_peaks = c_peaks.to(device).float()
-        if h_peaks is not None:
-            h_peaks = h_peaks.to(device).float()
-        if formula_vector is not None:
-            formula_vector = formula_vector.to(device).float()
-        if c_nmr_mask is not None:
-            c_nmr_mask = c_nmr_mask.to(device).long()
-        if h_nmr_mask is not None:
-            h_nmr_mask = h_nmr_mask.to(device).long()
-        
-        # 编码NMR数据（根据配置）
-        z_c = None
-        if self.c_encoder is not None and c_peaks is not None:
-            z_c = self.c_encoder(c_peaks, mask=c_nmr_mask)
-        
-        z_h = None
-        if self.h_encoder is not None and h_peaks is not None:
-            z_h = self.h_encoder(h_peaks, mask=h_nmr_mask)
-        
-        # 编码公式指导
-        z_guidance = None
-        if self.formula_encoder is not None and formula_vector is not None:
-            # 确保formula_vector有正确的形状
-            if formula_vector.dim() == 1:
-                formula_vector = formula_vector.unsqueeze(0)
+                
+                # 验证向量维度
+                expected_dim = self.config.FORMULA_VECTOR_SIZE
+                actual_dim = formula_vector.shape[1]
+                if actual_dim != expected_dim:
+                    pass # Warning already logged in validation?
+                    # For generation, we fix it silently or reuse logic
+                    if actual_dim < expected_dim:
+                        padding = torch.zeros(formula_vector.shape[0], expected_dim - actual_dim, device=device)
+                        formula_vector = torch.cat([formula_vector, padding], dim=1)
+                    else:
+                        formula_vector = formula_vector[:, :expected_dim]
+                
+                z_guidance = self.formula_encoder(formula_vector)
             
-            # 验证向量维度
-            expected_dim = self.config.FORMULA_VECTOR_SIZE
-            actual_dim = formula_vector.shape[1]
-            if actual_dim != expected_dim:
-                pass # Warning already logged in validation?
-                # For generation, we fix it silently or reuse logic
-                if actual_dim < expected_dim:
-                    padding = torch.zeros(formula_vector.shape[0], expected_dim - actual_dim, device=device)
-                    formula_vector = torch.cat([formula_vector, padding], dim=1)
+            # 融合所有模态
+            encoder_hidden = self.fusion(z_c, z_h, z_guidance)
+            
+            # 创建encoder输出
+            encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
+            
+            # 创建attention mask
+            batch_size_actual = encoder_hidden.shape[0]
+            seq_len = encoder_hidden.shape[1]
+            mask_list = []
+            if c_nmr_mask is not None:
+                mask_list.append(c_nmr_mask)
+            if h_nmr_mask is not None:
+                mask_list.append(h_nmr_mask)
+
+            if len(mask_list) > 0:
+                attention_mask = torch.cat(mask_list, dim=1)
+                if z_guidance is not None:
+                    formula_mask = torch.ones(batch_size_actual, 1, dtype=torch.long, device=device)
+                    attention_mask = torch.cat([attention_mask, formula_mask], dim=1)
+            else:
+                attention_mask = torch.ones(batch_size_actual, seq_len, dtype=torch.long, device=device)
+
+            if attention_mask.shape[1] != seq_len:
+                if attention_mask.shape[1] > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
                 else:
-                    formula_vector = formula_vector[:, :expected_dim]
-            
-            z_guidance = self.formula_encoder(formula_vector)
-        
-        # 融合所有模态
-        encoder_hidden = self.fusion(z_c, z_h, z_guidance)
-        
-        # 创建encoder输出
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
-        
-        # 创建attention mask
-        batch_size_actual = encoder_hidden.shape[0]
-        seq_len = encoder_hidden.shape[1]
-        mask_list = []
-        if c_nmr_mask is not None:
-            mask_list.append(c_nmr_mask)
-        if h_nmr_mask is not None:
-            mask_list.append(h_nmr_mask)
-
-        if len(mask_list) > 0:
-            attention_mask = torch.cat(mask_list, dim=1)
-            if z_guidance is not None:
-                formula_mask = torch.ones(batch_size_actual, 1, dtype=torch.long, device=device)
-                attention_mask = torch.cat([attention_mask, formula_mask], dim=1)
-        else:
-            attention_mask = torch.ones(batch_size_actual, seq_len, dtype=torch.long, device=device)
-
-        if attention_mask.shape[1] != seq_len:
-            if attention_mask.shape[1] > seq_len:
-                attention_mask = attention_mask[:, :seq_len]
-            else:
-                padding = torch.zeros(
-                    batch_size_actual, seq_len - attention_mask.shape[1],
-                    dtype=torch.long, device=device
-                )
-                attention_mask = torch.cat([attention_mask, padding], dim=1)
+                    padding = torch.zeros(
+                        batch_size_actual, seq_len - attention_mask.shape[1],
+                        dtype=torch.long, device=device
+                    )
+                    attention_mask = torch.cat([attention_mask, padding], dim=1)
         
         try:
             # 使用T5生成
@@ -1074,22 +1320,8 @@ class NMR2SMILESModel(pl.LightningModule):
         if tokens is None or len(tokens) == 0:
             return ""
         if isinstance(tokens, torch.Tensor):
-            tokens = tokens.cpu().numpy().tolist()
-        elif hasattr(tokens, 'tolist'):
-            tokens = tokens.tolist()
-        else:
-            tokens = list(tokens)
+            tokens = tokens.cpu().numpy()
         
-        # Try using tokenizer's decode method if available (NMRMind has this)
-        if hasattr(self.tokenizer, 'decode'):
-            try:
-                smiles = self.tokenizer.decode(tokens, skip_special_tokens=True)
-                smiles = re.sub(r"\s+", "", smiles)
-                return smiles
-            except Exception:
-                pass  # Fallback to manual method
-        
-        # Manual conversion for legacy tokenizer
         token_strings: List[str] = []
         found_eos = False
         
