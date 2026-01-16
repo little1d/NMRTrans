@@ -14,8 +14,6 @@ logger = logging.getLogger(__name__)
 from rdkit import Chem, DataStructs, rdBase
 from rdkit.Chem import AllChem
 
-
-
 # ===========================================================
 # 1. PeakEncoder —— 用于 H-NMR 与 C-NMR（输入 list[float]）
 # ===========================================================
@@ -699,7 +697,122 @@ class NMR2SMILESModel(pl.LightningModule):
         if self.trainer and self.trainer.optimizers:
             current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
             self.log("lr", current_lr, prog_bar=False, logger=True)
-        
+            
+        # ===== Reinforcement Learning (Validity Optimization) =====
+        if getattr(self.config, "USE_RL", False):
+            rl_loss = torch.tensor(0.0, device=self.device)
+            try:
+                # 1. Sampling (Rollout)
+                # Use greedy decoding or sampling to generate sequences
+                # Note: We use a simplified generation here to avoid overhead
+                with torch.no_grad():
+                    # Generate sequences using the model
+                    # For RL, we might want to use sampling (do_sample=True) to explore
+                    generated_ids = self.generate(
+                        c_peaks=c_peaks,
+                        h_peaks=h_peaks,
+                        formula_vector=formula_vector,
+                        c_nmr_mask=c_nmr_mask,
+                        h_nmr_mask=h_nmr_mask,
+                        max_length=self.config.MAX_SMILES_LENGTH + 5,
+                        num_beams=1,
+                        do_sample=True, # Exploration
+                        top_k=50,
+                        top_p=0.95,
+                    )
+                
+                # 2. Reward Calculation
+                rewards = []
+                # Decode generated sequences
+                generated_seqs = [self.tokens_to_smiles(ids) for ids in generated_ids]
+                
+                for smi in generated_seqs:
+                    # Reward function: +1 for valid, -0.1 for invalid
+                    if smi and Chem.MolFromSmiles(smi):
+                        rewards.append(1.0)
+                    else:
+                        rewards.append(-0.1) 
+                
+                rewards = torch.tensor(rewards, device=self.device)
+                
+                # Baseline (optional, simply mean reward of batch)
+                baseline = rewards.mean()
+                advantages = rewards - baseline
+                
+                # 3. Policy Gradient Loss Computation
+                # We need to re-evaluate the generated sequences to get their log probs with gradients
+                # Create input_ids and labels for the generated sequences
+                # Generated_ids: (B, L) -> we need to prepend decoder_start_token
+                
+                # Prepare decoder inputs: <pad> + sequence
+                # Note: T5 decoder_start_token_id is usually PAD_TOKEN_ID or 0
+                decoder_input_ids = torch.zeros_like(generated_ids)
+                decoder_input_ids[:, 0] = self.config.PAD_TOKEN_ID
+                decoder_input_ids[:, 1:] = generated_ids[:, :-1]
+                
+                # Attention mask for generated sequences
+                gen_attention_mask = (generated_ids != self.config.PAD_TOKEN_ID).long()
+                
+                # Forward pass on generated sequences
+                # Note: We need to pass encoder outputs again or re-encode
+                # To save memory, we re-encode (or use cached encoder_outputs if we structurally change forward)
+                # Here we just call forward again with generated labels
+                
+                # Labels for loss: generated_ids (with -100 for padding)
+                gen_labels = generated_ids.clone()
+                gen_labels[gen_labels == self.config.PAD_TOKEN_ID] = -100
+                
+                rl_outputs = self(
+                    c_peaks=c_peaks,
+                    h_peaks=h_peaks,
+                    formula_vector=formula_vector,
+                    smiles_ids=gen_labels, # Use generated sequences as targets
+                    c_nmr_mask=c_nmr_mask,
+                    h_nmr_mask=h_nmr_mask,
+                )
+                
+                # rl_outputs.logits: (B, L, V)
+                # Calculate log probs of the generated tokens
+                log_probs = F.log_softmax(rl_outputs.logits, dim=-1)
+                
+                # Gather log probs of the actual generated tokens
+                # generated_ids: (B, L)
+                # We need to gather the log_prob corresponding to the token at each position
+                
+                # Flatten for gather
+                # log_probs: (B*L, V)
+                # generated_ids: (B*L)
+                # But we need to be careful with masking (ignore padding)
+                
+                # Using nll_loss with reduction='none' is easier
+                # target: (B, L)
+                # input: (B, V, L) -> permute to (B, V, L) for nll_loss? No, (B, C, d1...)
+                
+                # Let's use torch.gather
+                # logits: (B, L, V)
+                token_log_probs = log_probs.gather(2, generated_ids.unsqueeze(-1)).squeeze(-1) # (B, L)
+                
+                # Mask out padding/special tokens if needed, effectively sum log_probs over sequence
+                # valid_gen_mask: (B, L)
+                valid_gen_mask = (generated_ids != self.config.PAD_TOKEN_ID)
+                
+                # Sum log probs for each sequence
+                seq_log_probs = (token_log_probs * valid_gen_mask).sum(dim=1) # (B,)
+                
+                # RL Loss = - (Advantage * LogProb)
+                # Minimizing loss = Maximizing Reward
+                loss_rl = - (advantages * seq_log_probs).mean()
+                
+                rl_weight = getattr(self.config, "RL_WEIGHT", 0.1)
+                loss = loss + rl_weight * loss_rl
+                
+                # Log RL metrics
+                self.log("train_rl_reward", rewards.mean(), prog_bar=True, sync_dist=True, logger=True)
+                self.log("train_rl_loss", loss_rl, prog_bar=False, logger=True)
+                
+            except Exception as e:
+                logger.warning(f"RL Step Failed: {e}")
+                
         return loss
     
     @staticmethod

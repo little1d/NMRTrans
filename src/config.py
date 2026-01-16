@@ -138,6 +138,12 @@ class TrainingConfig:
     TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
     LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
     EPOCHS = _get_config("EPOCHS", 8000)
+    
+    # ========== RL/Fine-tuning Configuration ==========
+    USE_RL = _get_config("USE_RL", False)  # Enable Reinforcement Learning for validity
+    RL_WEIGHT = _get_config("RL_WEIGHT", 0.1)  # Weight for RL loss
+    RL_JITTER = _get_config("RL_JITTER", False) # Use jitter during RL sampling
+    
     GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
     ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
     
