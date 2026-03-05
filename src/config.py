@@ -64,6 +64,17 @@ def _infer_t5_d_model(model_name: str, fallback: int = 512) -> int:
             return value
     return fallback
 
+def _infer_bart_d_model(model_name: str, fallback: int = 768) -> int:
+    """Infer BART d_model size from model name or path."""
+    name = os.path.basename(str(model_name)).lower()
+    bart_d_model_map = {
+        "bart-base": 768,
+        "bart-large": 1024,
+    }
+    for key, value in bart_d_model_map.items():
+        if key in name:
+            return value
+    return fallback
 
 # Default paths (will be overridden by config_local.py if it exists)
 _DEFAULT_MERGED_DATA_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/cache/MSD_data"
@@ -89,6 +100,9 @@ class TrainingConfig:
     VOCAB_PATH = _get_config("VOCAB_PATH", _DEFAULT_VOCAB_PATH)
     
     # ========== Tokenizer Configuration ==========
+    TOKENIZER_TYPE = _get_config("TOKENIZER_TYPE", "custom") # "custom" or "nmrmind"
+    VOCAB_NMRMIND_PATH = _get_config("VOCAB_NMRMIND_PATH", "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/vocab_nmrmind.json")
+    
     SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
     
     # ========== Data Configuration ==========
@@ -101,6 +115,10 @@ class TrainingConfig:
     # ===== 消融实验配置：控制使用的NMR模态 =====
     USE_C_NMR = _get_config("USE_C_NMR", True)  # 是否使用 C-NMR
     USE_H_NMR = _get_config("USE_H_NMR", True)  # 是否使用 H-NMR
+
+        # 消融实验配置
+    ENCODER_TYPE = _get_config("ENCODER_TYPE", "vanilla_no_pos")  # 可选: "set_transformer", "vanilla_pos", "vanilla_no_pos"
+
     
     # Formula encoder 配置
     FORMULA_ENCODER_D_MODEL = 512  # 与 peak encoder 相同
@@ -118,11 +136,23 @@ class TrainingConfig:
     T5_MODEL_NAME = _get_config("T5_MODEL_NAME", "t5-small")  # t5-small, t5-base, t5-large
     FREEZE_T5_DECODER = _get_config("FREEZE_T5_DECODER", False)
     USE_RANDOM_T5_INIT = _get_config("USE_RANDOM_T5_INIT", False)
+    REMOVE_CROSS_ATTENTION_POSITION_BIAS = _get_config("REMOVE_CROSS_ATTENTION_POSITION_BIAS", True) # 移除cross-attention的位置偏置
+    SHUFFLE_ENCODER_OUTPUTS = _get_config("SHUFFLE_ENCODER_OUTPUTS", False) # 训练时随机打乱encoder输出
+    USE_CUSTOM_DECODER = _get_config("USE_CUSTOM_DECODER", False)    
     
+    # ========== BART Model Configuration ==========
+    BART_MODEL_NAME = _get_config("BART_MODEL_NAME", "facebook/bart-base")  # 或 "facebook/bart-large"
+    FREEZE_BART_DECODER = _get_config("FREEZE_BART_DECODER", False)
+    USE_RANDOM_BART_INIT = _get_config("USE_RANDOM_BART_INIT", False)
+    BART_D_MODEL = _get_config("BART_D_MODEL", 768)  # BART-base 的 hidden size
+    BART_NUM_LAYERS = _get_config("BART_NUM_LAYERS", 6)
+    BART_NUM_HEADS = _get_config("BART_NUM_HEADS", 12)
+
     # ========== Peak Encoder Configuration ==========
     PEAK_ENCODER_D_MODEL = _get_config(
         "PEAK_ENCODER_D_MODEL",
         _infer_t5_d_model(_get_config("T5_MODEL_NAME", "t5-small")),
+        # _infer_bart_d_model(_get_config("BART_MODEL_NAME", "facebook/bart-base")),
     )
     PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 6)  # 增加到6层
     PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 8)  # 增加注意力头
@@ -138,12 +168,6 @@ class TrainingConfig:
     TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
     LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
     EPOCHS = _get_config("EPOCHS", 8000)
-    
-    # ========== RL/Fine-tuning Configuration ==========
-    USE_RL = _get_config("USE_RL", False)  # Enable Reinforcement Learning for validity
-    RL_WEIGHT = _get_config("RL_WEIGHT", 0.1)  # Weight for RL loss
-    RL_JITTER = _get_config("RL_JITTER", False) # Use jitter during RL sampling
-    
     GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
     ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
     
@@ -161,7 +185,7 @@ class TrainingConfig:
     
     # ========== Device Configuration ==========
     DEVICES = _get_config("DEVICES", 8)  # Number of GPUs
-    PRECISION = _get_config("PRECISION", "bf16-mixed")  # "16-mixed", "bf16-mixed", "32"
+    PRECISION = _get_config("PRECISION", "32")  # "16-mixed", "bf16-mixed", "32"
     
     # ========== Special Token IDs ==========
     # These will be set by prepare_tokenizer()
@@ -170,6 +194,7 @@ class TrainingConfig:
     EOS_TOKEN_ID = None
     MASK_TOKEN_ID = None
     UNK_TOKEN_ID = None
+    DECODER_START_TOKEN_ID = None
     
     # ========== Checkpoint Configuration ==========
     RESUME_CHECKPOINT = _get_config("RESUME_CHECKPOINT", None)
@@ -193,14 +218,21 @@ def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):
             sys.path.insert(0, src_path)
         
         # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
-        # 直接从当前目录导入（因为 tokenizer.py 和 config.py 在同一目录）
-        from tokenizer import RegexSMILESTokenizer
-        vocab_path = config.VOCAB_PATH
-        if not vocab_path:
-            raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
-            
-        logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
-        tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
+        if config.TOKENIZER_TYPE == "nmrmind":
+            from tokenizer_nmrmind import NMRMindTokenizer
+            vocab_path = config.VOCAB_NMRMIND_PATH
+            if not vocab_path:
+                raise ValueError("配置中缺少VOCAB_NMRMIND_PATH参数，无法加载NMRMind tokenizer")
+            logger.info(f"从 {vocab_path} 加载 NMRMindTokenizer")
+            tokenizer = NMRMindTokenizer(vocab_path)
+        else:
+            from tokenizer import RegexSMILESTokenizer
+            vocab_path = config.VOCAB_PATH
+            if not vocab_path:
+                raise ValueError("配置中缺少VOCAB_PATH参数，无法加载自定义tokenizer")
+                
+            logger.info(f"从 {vocab_path} 加载自定义RegexSMILESTokenizer")
+            tokenizer = RegexSMILESTokenizer.from_file(vocab_path)
         
         # Set special token IDs to config
         config.PAD_TOKEN_ID = tokenizer.pad_token_id

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point for training the Spectra2Smiles-AR model with T5."""
+"""Entry point for training the Spectra2Smiles-AR model with T5 using new data format."""
 
 import argparse
 import logging
@@ -7,10 +7,16 @@ import os
 import sys
 import time
 import warnings
+import json
+import re
 from datetime import datetime
 from functools import partial
-import re
 from collections import defaultdict, Counter
+
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  # 完全离线模式
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"        # 禁用 Hugging Face Hub
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"  # 禁用进度条
 
 import numpy as np
 import pytorch_lightning as pl
@@ -130,8 +136,61 @@ def parse_chemical_formula_to_vector(formula: str, atom_mapping: dict) -> torch.
     
     return vec
 
+def pad_j_coupling(j_coupling_list, max_j=6):
+    """Pad J-coupling list to fixed length"""
+    if not isinstance(j_coupling_list, list):
+        j_coupling_list = []
+    
+    padded = [0.0] * max_j
+    for i, val in enumerate(j_coupling_list[:max_j]):
+        try:
+            padded[i] = float(val)
+        except (TypeError, ValueError):
+            padded[i] = 0.0
+    return padded
+
+def prepare_h_nmr_features(tokenized_input_str, split_vocab):
+    """Prepare 1HNMR features from tokenized_input string"""
+    try:
+        tokenized_input = json.loads(tokenized_input_str)
+        h_nmr_data = tokenized_input.get("1HNMR", [])
+        
+        features = []
+        for peak in h_nmr_data:
+            if len(peak) < 4:
+                continue
+            
+            # 1. chemical_shift (numeric)
+            chem_shift = float(peak[0])
+            
+            # 2. split pattern (discrete token)
+            split_str = str(peak[2]).strip().lower() if len(peak) > 2 else "<unk>"
+            split_idx = split_vocab.get(split_str, 0)  # 0 is "<unk>" index
+            
+            # 3. integral (numeric)
+            integral_str = str(peak[3]).strip() if len(peak) > 3 else '1H'
+            # Extract number before 'H'
+            integral_value = 1.0
+            match = re.search(r'(\d+)(?:H|h)?', integral_str)
+            if match:
+                integral_value = float(match.group(1))
+            
+            # 4. J-coupling (6 numeric values, padded)
+            j_coupling = peak[4] if len(peak) > 4 and isinstance(peak[4], list) else []
+            padded_j = pad_j_coupling(j_coupling)
+            
+            # Combine all features: [chem_shift, split_idx, integral_value, j1-j6]
+            peak_features = [chem_shift, split_idx, integral_value] + padded_j
+            features.append(peak_features)
+        
+        return features
+        
+    except Exception as e:
+        logger.warning(f"Error preparing H-NMR features: {str(e)}")
+        return []
+
 def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=False):
-    """处理NMR峰值数据集的collate函数，包含化学式向量"""
+    """处理新格式的NMR峰值数据集的collate函数，包含化学式向量"""
     # 过滤None值
     batch = [b for b in batch if b is not None]
     if not batch:
@@ -159,72 +218,24 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
     # 2. 处理谱图数据
     spectra_data = {}
     
-    # H-NMR处理
-    if "h_nmr_peaks" in batch[0] and batch[0]["h_nmr_peaks"] is not None:
-        h_peaks_list = []
-        for item in batch:
-            if item["h_nmr_peaks"] is not None and len(item["h_nmr_peaks"]) > 0:
-                h_peaks = torch.tensor(item["h_nmr_peaks"], dtype=torch.float)
-                
-                # ===== 修改：基于峰组的JITTER =====
-                if apply_jitter and config.NMR_JITTER_RANGE_H > 0:
-                    # 1. 四舍五入到0.01ppm精度（H-NMR）
-                    rounded_peaks = torch.round(h_peaks * 100) / 100.0
-                    
-                    # 2. 找到唯一的ppm值
-                    unique_ppm = torch.unique(rounded_peaks)
-                    
-                    # 3. 为每个唯一的ppm值生成相同的噪声
-                    jitter_dict = {}
-                    for ppm_val in unique_ppm.tolist():
-                        noise = torch.empty(1).uniform_(
-                            -config.NMR_JITTER_RANGE_H, 
-                            config.NMR_JITTER_RANGE_H
-                        ).item()
-                        jitter_dict[ppm_val] = noise
-                    
-                    # 4. 应用噪声：相同ppm值加相同噪声
-                    noisy_peaks = h_peaks.clone()
-                    for i, ppm_val in enumerate(rounded_peaks.tolist()):
-                        original_val = h_peaks[i].item()
-                        noise = jitter_dict[ppm_val]
-                        noisy_peaks[i] = original_val + noise
-                    
-                    h_peaks = noisy_peaks
-                
-                h_peaks = h_peaks.unsqueeze(-1)
-                h_peaks = torch.clamp(h_peaks / 15.0, 0.0, 1.0)  # 归一化
-                h_peaks_list.append(h_peaks)
-            else:
-                h_peaks_list.append(torch.zeros((0, 1)))
-        h_peaks_padded, h_mask = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
-        spectra_data["h_nmr_peaks"] = h_peaks_padded
-        spectra_data["h_nmr_mask"] = h_mask
-
-        if not hasattr(peaks_collate_fn, "_logged_h_sample"):
-            sample_peaks = h_peaks_padded[0].squeeze(-1).tolist()
-            sample_mask = h_mask[0].tolist()
-            logger.info("H-NMR padding sample (first item):")
-            logger.info(f"  padded_peaks={sample_peaks}")
-            logger.info(f"  mask={sample_mask}")
-            peaks_collate_fn._logged_h_sample = True
+    # 定义split词汇表
+    split_vocab = {
+        "<unk>": 0, "m": 1, "d": 2, "s": 3, "dd": 4, "t": 5, "ddd": 6, "q": 7, 
+        "dt": 8, "br": 9, "dq": 10, "ddt": 11, "tt": 12, "sept": 13, "dm": 14, "oct": 15
+    }
     
     # C-NMR处理
-    if "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
+    if any("c_nmr_peaks" in item for item in batch):
         c_peaks_list = []
         for item in batch:
-            if item["c_nmr_peaks"] is not None and len(item["c_nmr_peaks"]) > 0:
-                c_peaks = torch.tensor(item["c_nmr_peaks"], dtype=torch.float)
+            c_peaks = item.get("c_nmr_peaks", [])
+            if c_peaks and len(c_peaks) > 0:
+                c_peaks_tensor = torch.tensor(c_peaks, dtype=torch.float)
                 
-                # ===== 修改：基于峰组的JITTER =====
+                # JITTER处理
                 if apply_jitter and config.NMR_JITTER_RANGE_C > 0:
-                    # 1. 四舍五入到0.1ppm精度（C-NMR）
-                    rounded_peaks = torch.round(c_peaks * 10) / 10.0
-                    
-                    # 2. 找到唯一的ppm值
+                    rounded_peaks = torch.round(c_peaks_tensor * 10) / 10.0
                     unique_ppm = torch.unique(rounded_peaks)
-                    
-                    # 3. 为每个唯一的ppm值生成相同的噪声
                     jitter_dict = {}
                     for ppm_val in unique_ppm.tolist():
                         noise = torch.empty(1).uniform_(
@@ -232,60 +243,71 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
                             config.NMR_JITTER_RANGE_C
                         ).item()
                         jitter_dict[ppm_val] = noise
-                    
-                    # 4. 应用噪声：相同ppm值加相同噪声
-                    noisy_peaks = c_peaks.clone()
+                    noisy_peaks = c_peaks_tensor.clone()
                     for i, ppm_val in enumerate(rounded_peaks.tolist()):
-                        original_val = c_peaks[i].item()
+                        original_val = c_peaks_tensor[i].item()
                         noise = jitter_dict[ppm_val]
                         noisy_peaks[i] = original_val + noise
-                    
-                    c_peaks = noisy_peaks
+                    c_peaks_tensor = noisy_peaks
                 
-                c_peaks = c_peaks.unsqueeze(-1)
-                c_peaks = torch.clamp(c_peaks / 220.0, 0.0, 1.0)  # 归一化
-                c_peaks_list.append(c_peaks)
+                c_peaks_tensor = c_peaks_tensor.unsqueeze(-1)
+                c_peaks_tensor = torch.clamp(c_peaks_tensor / 220.0, 0.0, 1.0)  # 归一化
+                c_peaks_list.append(c_peaks_tensor)
             else:
                 c_peaks_list.append(torch.zeros((0, 1)))
+        
         c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
         spectra_data["c_nmr_peaks"] = c_peaks_padded
         spectra_data["c_nmr_mask"] = c_mask
-
-        if not hasattr(peaks_collate_fn, "_logged_c_sample"):
-            sample_peaks = c_peaks_padded[0].squeeze(-1).tolist()
-            sample_mask = c_mask[0].tolist()
-            logger.info("C-NMR padding sample (first item):")
-            logger.info(f"  padded_peaks={sample_peaks}")
-            logger.info(f"  mask={sample_mask}")
-            peaks_collate_fn._logged_c_sample = True
     
-    # ===== 新增：处理化学式向量 =====
+    # 1HNMR特征处理
+    if any("tokenized_input" in item for item in batch):
+        h_features_list = []
+        max_peaks = 0
+        
+        for item in batch:
+            tokenized_input_str = item.get("tokenized_input", "")
+            h_features = prepare_h_nmr_features(tokenized_input_str, split_vocab)
+            max_peaks = max(max_peaks, len(h_features))
+            h_features_list.append(h_features)
+        
+        # Pad to config.MAX_PEAKS
+        max_peaks = min(max_peaks, config.MAX_PEAKS)
+        
+        # Create tensor (B, L, 9) where 9 = [chem_shift, split_idx, integral, j1-j6]
+        h_features_tensor = torch.zeros(len(batch), max_peaks, 9)
+        h_mask = torch.zeros(len(batch), max_peaks, dtype=torch.long)
+        
+        for i, features in enumerate(h_features_list):
+            num_peaks = min(len(features), max_peaks)
+            if num_peaks > 0:
+                for j in range(num_peaks):
+                    h_features_tensor[i, j] = torch.tensor(features[j])
+                h_mask[i, :num_peaks] = 1
+        
+        spectra_data["h_nmr_features"] = h_features_tensor
+        spectra_data["h_nmr_mask"] = h_mask
+    
+    # 化学式向量
     if config.USE_FORMULA_GUIDANCE and atom_mapping is not None:
         formula_vectors = []
-        formula_strings = []  # 用于日志记录
+        formula_strings = []
         
         for item in batch:
             formula = item.get("molecular_formula", "")
             formula_strings.append(formula)
-            
-            # 转换为向量
             vec = parse_chemical_formula_to_vector(formula, atom_mapping)
             formula_vectors.append(vec)
         
-        # 堆叠为batch tensor
-        formula_tensor = torch.stack(formula_vectors)  # (B, formula_vector_size)
+        formula_tensor = torch.stack(formula_vectors)
         spectra_data["formula_vector"] = formula_tensor
-        spectra_data["formula_strings"] = formula_strings  # 用于验证时显示
-    
+        spectra_data["formula_strings"] = formula_strings
+
     return {
         "smiles": smiles_tensor,
         "original_smiles": original_smiles_list,
         **spectra_data
     }
-
-
-
-
 
 def build_dataloaders(config: TrainingConfig, tokenizer):
     """Build data loaders for training and validation with formula guidance."""
@@ -321,20 +343,19 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     else:
         logger.info("❌ 未使用分子式指导")
     
-    # 选择 collate_fn
-    target_collate_fn = peaks_collate_fn
+    # 使用 peaks_collate_fn 处理连续谱图数据
     logger.info("Using peaks_collate_fn for continuous spectra input.")
 
     # 创建带tokenizer和atom_mapping的partial collate函数
     train_collate_fn = partial(
-        target_collate_fn,
+        peaks_collate_fn,
         tokenizer=tokenizer,
         config=config,
         atom_mapping=atom_mapping,
         apply_jitter=getattr(config, "USE_NMR_JITTER", False),
     )
     val_collate_fn = partial(
-        target_collate_fn,
+        peaks_collate_fn,
         tokenizer=tokenizer,
         config=config,
         atom_mapping=atom_mapping,
@@ -398,9 +419,8 @@ def build_dataloaders(config: TrainingConfig, tokenizer):
     
     return train_loader, val_loader
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Train Spectra2Smiles-AR with T5")
+    parser = argparse.ArgumentParser(description="Train Spectra2Smiles-AR with T5 using new data format")
     parser.add_argument(
         "--ckpt_path",
         type=str,
@@ -511,7 +531,6 @@ def main():
     )
 
     logger.info("\n训练完成！最佳模型已通过 ModelCheckpoint 自动保存。")
-
 
 if __name__ == "__main__":
     main()

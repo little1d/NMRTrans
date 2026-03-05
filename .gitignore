@@ -23,4 +23,7 @@ config_local.py
 dist/
 build/
 *.egg-info/
+
+# macOS system files
 .DS_Store
+**/.DS_Store
