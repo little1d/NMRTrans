@@ -1061,124 +1061,124 @@ class NMR2SMILESModel(pl.LightningModule):
         # ---------------------------------------------------------
         # Generation Logic
         # ---------------------------------------------------------
-            # 确定设备
-            device = next(self.parameters()).device
-            
-            # 处理单个样本情况（添加批次维度）
-            # 优先从启用的NMR模态确定batch_size
-            if batch_size is None:
-                # 优先从C-NMR确定
-                if c_peaks is not None:
-                    if c_peaks.dim() == 1:
-                        c_peaks = c_peaks.unsqueeze(0)
-                    batch_size = c_peaks.shape[0]
-                # 如果C-NMR不可用，从H-NMR确定
-                elif h_features is not None:  # Use h_features instead of h_peaks
-                    if h_features.dim() == 1:
-                        h_features = h_features.unsqueeze(0)
-                    batch_size = h_features.shape[0]
-                # 如果NMR都不可用（不应该发生，因为前面已验证），从Formula确定
-                elif formula_vector is not None:
-                    if formula_vector.dim() == 1:
-                        formula_vector = formula_vector.unsqueeze(0)
-                    batch_size = formula_vector.shape[0]
-                else:
-                    raise ValueError("无法确定batch_size：所有输入都是None")
-            else:
-                batch_size = batch_size # Explicitly set
-            
-            # 确保所有输入都在正确设备上
+        # 确定设备
+        device = next(self.parameters()).device
+        
+        # 处理单个样本情况（添加批次维度）
+        # 优先从启用的NMR模态确定batch_size
+        if batch_size is None:
+            # 优先从C-NMR确定
             if c_peaks is not None:
-                c_peaks = c_peaks.to(device).float()
-            if c_nmr_mask is not None:
-                c_nmr_mask = c_nmr_mask.to(device).long()
-            if h_features is not None:  # Use h_features instead of h_peaks
-                h_features = h_features.to(device).float()
-            if h_nmr_mask is not None:
-                h_nmr_mask = h_nmr_mask.to(device).long()
-            if formula_vector is not None:
-                formula_vector = formula_vector.to(device).float()
-            
-            # 编码NMR数据（根据配置）
-            z_c = None
-            g_c = None
-            if self.c_encoder is not None and c_peaks is not None:
-                z_c, g_c, c_nmr_mask = self.c_encoder(c_peaks, mask=c_nmr_mask)
-            
-            z_h = None
-            g_h = None
-            if self.h_encoder is not None and h_features is not None:  # Use h_features
-                z_h, g_h, h_nmr_mask = self.h_encoder(h_features, mask=h_nmr_mask)
-            
-            # 编码公式指导
-            z_guidance = None
-            if self.formula_encoder is not None and formula_vector is not None:
-                # 确保formula_vector有正确的形状
+                if c_peaks.dim() == 1:
+                    c_peaks = c_peaks.unsqueeze(0)
+                batch_size = c_peaks.shape[0]
+            # 如果C-NMR不可用，从H-NMR确定
+            elif h_features is not None:  # Use h_features instead of h_peaks
+                if h_features.dim() == 1:
+                    h_features = h_features.unsqueeze(0)
+                batch_size = h_features.shape[0]
+            # 如果NMR都不可用（不应该发生，因为前面已验证），从Formula确定
+            elif formula_vector is not None:
                 if formula_vector.dim() == 1:
                     formula_vector = formula_vector.unsqueeze(0)
-                # 验证向量维度
-                expected_dim = self.config.FORMULA_VECTOR_SIZE
-                actual_dim = formula_vector.shape[1]
-                if actual_dim != expected_dim:
-                    pass # Warning already logged in validation?
-                # For generation, we fix it silently or reuse logic
-                if actual_dim < expected_dim:
-                    padding = torch.zeros(formula_vector.shape[0], expected_dim - actual_dim, device=device)
-                    formula_vector = torch.cat([formula_vector, padding], dim=1)
-                else:
-                    formula_vector = formula_vector[:, :expected_dim]
-                z_guidance = self.formula_encoder(formula_vector)
-            
-            # g_c = None
-            # g_h = None
-            # 融合所有模态
-            encoder_hidden, attention_mask = self.fusion(z_c, z_h, g_c, g_h, z_guidance, c_nmr_mask, h_nmr_mask)
-            
-            # 创建encoder输出
-            encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
-            
+                batch_size = formula_vector.shape[0]
+            else:
+                raise ValueError("无法确定batch_size：所有输入都是None")
+        else:
+            batch_size = batch_size # Explicitly set
+        
+        # 确保所有输入都在正确设备上
+        if c_peaks is not None:
+            c_peaks = c_peaks.to(device).float()
+        if c_nmr_mask is not None:
+            c_nmr_mask = c_nmr_mask.to(device).long()
+        if h_features is not None:  # Use h_features instead of h_peaks
+            h_features = h_features.to(device).float()
+        if h_nmr_mask is not None:
+            h_nmr_mask = h_nmr_mask.to(device).long()
+        if formula_vector is not None:
+            formula_vector = formula_vector.to(device).float()
+        
+        # 编码NMR数据（根据配置）
+        z_c = None
+        g_c = None
+        if self.c_encoder is not None and c_peaks is not None:
+            z_c, g_c, c_nmr_mask = self.c_encoder(c_peaks, mask=c_nmr_mask)
+        
+        z_h = None
+        g_h = None
+        if self.h_encoder is not None and h_features is not None:  # Use h_features
+            z_h, g_h, h_nmr_mask = self.h_encoder(h_features, mask=h_nmr_mask)
+        
+        # 编码公式指导
+        z_guidance = None
+        if self.formula_encoder is not None and formula_vector is not None:
+            # 确保formula_vector有正确的形状
+            if formula_vector.dim() == 1:
+                formula_vector = formula_vector.unsqueeze(0)
+            # 验证向量维度
+            expected_dim = self.config.FORMULA_VECTOR_SIZE
+            actual_dim = formula_vector.shape[1]
+            if actual_dim != expected_dim:
+                pass # Warning already logged in validation?
+            # For generation, we fix it silently or reuse logic
+            if actual_dim < expected_dim:
+                padding = torch.zeros(formula_vector.shape[0], expected_dim - actual_dim, device=device)
+                formula_vector = torch.cat([formula_vector, padding], dim=1)
+            else:
+                formula_vector = formula_vector[:, :expected_dim]
+            z_guidance = self.formula_encoder(formula_vector)
+        
+        # g_c = None
+        # g_h = None
+        # 融合所有模态
+        encoder_hidden, attention_mask = self.fusion(z_c, z_h, g_c, g_h, z_guidance, c_nmr_mask, h_nmr_mask)
+        
+        # 创建encoder输出
+        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
+        
+        try:
+            # 使用T5生成
+            generated_ids = self.t5.generate(
+                encoder_outputs=encoder_outputs,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                num_beams=num_beams,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                pad_token_id=self.config.PAD_TOKEN_ID,
+                eos_token_id=self.config.EOS_TOKEN_ID,
+                bos_token_id=self.config.BOS_TOKEN_ID,
+                **generate_kwargs,
+            )
+            return generated_ids
+        except Exception as e:
+            logger.error(f"T5 generation failed: {str(e)}")
+            logger.error(f"encoder_outputs shape: {encoder_hidden.shape}")
+            logger.error(f"attention_mask shape: {attention_mask.shape}")
+            # 尝试更简单的生成方式作为回退
             try:
-                # 使用T5生成
+                logger.warning("Attempting fallback generation with minimal parameters")
+                fallback_kwargs = dict(generate_kwargs)
+                # 再次确保 beam 与返回序列数兼容
+                fb_num_return_sequences = int(fallback_kwargs.get("num_return_sequences", 1))
+                fb_num_beams = max(num_beams, fb_num_return_sequences)
                 generated_ids = self.t5.generate(
                     encoder_outputs=encoder_outputs,
                     attention_mask=attention_mask,
                     max_length=max_length,
-                    num_beams=num_beams,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
+                    num_beams=fb_num_beams,
                     pad_token_id=self.config.PAD_TOKEN_ID,
                     eos_token_id=self.config.EOS_TOKEN_ID,
                     bos_token_id=self.config.BOS_TOKEN_ID,
-                    **generate_kwargs,
+                    **fallback_kwargs,
                 )
                 return generated_ids
-            except Exception as e:
-                logger.error(f"T5 generation failed: {str(e)}")
-                logger.error(f"encoder_outputs shape: {encoder_hidden.shape}")
-                logger.error(f"attention_mask shape: {attention_mask.shape}")
-                # 尝试更简单的生成方式作为回退
-                try:
-                    logger.warning("Attempting fallback generation with minimal parameters")
-                    fallback_kwargs = dict(generate_kwargs)
-                    # 再次确保 beam 与返回序列数兼容
-                    fb_num_return_sequences = int(fallback_kwargs.get("num_return_sequences", 1))
-                    fb_num_beams = max(num_beams, fb_num_return_sequences)
-                    generated_ids = self.t5.generate(
-                        encoder_outputs=encoder_outputs,
-                        attention_mask=attention_mask,
-                        max_length=max_length,
-                        num_beams=fb_num_beams,
-                        pad_token_id=self.config.PAD_TOKEN_ID,
-                        eos_token_id=self.config.EOS_TOKEN_ID,
-                        bos_token_id=self.config.BOS_TOKEN_ID,
-                        **fallback_kwargs,
-                    )
-                    return generated_ids
-                except Exception as e2:
-                    logger.error(f"Fallback generation also failed: {str(e2)}")
-                    raise
+            except Exception as e2:
+                logger.error(f"Fallback generation also failed: {str(e2)}")
+                raise
     
     def tokens_to_smiles(self, tokens) -> str:
         """Convert token sequence to SMILES string."""
