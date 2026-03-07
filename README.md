@@ -109,7 +109,7 @@ Spectra2Smiles-AR/
 If you use NMRTrans in your research, please cite:
 
 ```bibtex
-@article{yang2026nmrtransstructureelucidationexperimental,
+@article{yang2026nmrtrans,
       title={NMRTrans: Structure Elucidation from Experimental NMR Spectra via Set Transformers}, 
       author={Liujia Yang* and Zhuo Yang* and Jiaqing Xie* and Yubin Wang* and Ben Gao and Tianfan Fu and Xingjian Wei and Jiaxing Sun and Jiang Wu and Conghui He and Yuqiang Li and Qinying Gu},
       year={2026},
