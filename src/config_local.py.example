@@ -1,0 +1,53 @@
+# Example configuration file
+# Copy this file to config_local.py and modify the paths according to your setup
+
+# Data paths
+MERGED_DATA_DIR = "/path/to/your/data"
+VOCAB_PATH = "/path/to/vocab.json"
+SAVE_DIR = "/path/to/save/checkpoints"
+
+EPOCHS = 10000
+
+# SwanLab configuration
+USE_SWANLAB = True
+SWANLAB_PROJECT = "your-project-name"
+SWANLAB_RUN_NAME = "your-run-name"
+
+# Device configuration
+# We recommend using 2 GPUs (DEVICES=2) with a smaller batch size to best reproduce our results.
+DEVICES = 2
+
+# T5 Model - use local path or HuggingFace model name
+T5_MODEL_NAME = "/path/to/t5-model"  # or "t5-small", "t5-base", "t5-large"
+
+# Training hyperparameters
+BATCH_SIZE = 1024
+LEARNING_RATE = 1e-4
+ACCUM_GRAD_BATCHES = 1
+GRAD_CLIP = 1
+
+# Modality configuration (at least one NMR modality must be enabled)
+USE_C_NMR = True
+USE_H_NMR = True
+USE_FORMULA_GUIDANCE = True
+
+USE_RANDOM_T5_INIT = True
+PRECISION = 32
+
+# Resume from checkpoint (set to None to start training from scratch)
+RESUME_CHECKPOINT = None
+
+# NMR Augmentation: Enable jitter
+USE_NMR_JITTER = False
+
+# Peak Encoder hyperparameters
+PEAK_ENCODER_N_LAYERS = 6  
+PEAK_ENCODER_N_HEADS = 8 
+PEAK_ENCODER_FF_DIM = 1024 
+PEAK_ENCODER_DROPOUT = 0.1
+
+# Validation configuration
+CHECK_VAL_EVERY_N_EPOCH = 20
+
+# Test configuration
+# TEST_FILE = "/path/to/test.pkl.lz4"

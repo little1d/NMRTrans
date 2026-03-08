@@ -36,12 +36,19 @@ NMRTrans is a transformer-based framework that performs structure elucidation fr
     ```
 
 3. Configure local settings:
-   - Create or modify `src/config_local.py` to set your data paths and model configurations:
+   - Copy the example configuration file and modify it according to your setup:
+
+   ```bash
+   cp src/config_local.py.example src/config_local.py
+   ```
+
+   - Then edit `src/config_local.py` to set your data paths and model configurations:
 
    ```python
    MERGED_DATA_DIR = "/path/to/your/data"
    VOCAB_PATH = "/path/to/vocab.json"
    SAVE_DIR = "/path/to/save/checkpoints"
+   T5_MODEL_NAME = "/path/to/t5-model"  # or "t5-small", "t5-base", "t5-large"
    
    # Configure modalities (at least one NMR modality must be enabled)
    USE_C_NMR = True          # Use C-NMR spectra
@@ -89,19 +96,18 @@ python src/test.py --ckpt_path model.ckpt
 ## 📁 Project Structure
 
 ```
-Spectra2Smiles-AR/
+NMRTrans/
 ├── src/
-│   ├── callbacks.py       # 回调函数（包括checkpoint和SwanLab日志）
-│   ├── config.py          # 简化的配置
-│   ├── config_local.py    # 本地配置
-│   ├── data.py            # MergedDataset数据加载
-│   ├── model.py           # T5-based AR模型
-│   ├── test.py            # 测试/推理脚本
-│   ├── tokenizer.py       # SMILES tokenizer
-│   └── train.py           # 训练脚本
-└── scripts/
-    ├── rjob.sh
-    └── start_training.sh
+│   ├── callbacks.py          # Callbacks (checkpoint and SwanLab logging)
+│   ├── config.py             # Default configuration
+│   ├── config_local.py.example # Example local configuration (copy to config_local.py)
+│   ├── data.py                # MergedDataset data loading
+│   ├── model.py               # T5-based autoregressive model
+│   ├── test.py                # Inference/evaluation script
+│   ├── tokenizer.py           # SMILES tokenizer
+│   └── train.py               # Training script
+└── assets/
+    └── main.png               # Framework diagram
 ```
 
 ## 📝 Citation
