@@ -98,16 +98,16 @@ python src/test.py --ckpt_path model.ckpt
 ```
 NMRTrans/
 ├── src/
-│   ├── callbacks.py          # Callbacks (checkpoint and SwanLab logging)
-│   ├── config.py             # Default configuration
-│   ├── config_local.py.example # Example local configuration (copy to config_local.py)
-│   ├── data.py                # MergedDataset data loading
-│   ├── model.py               # T5-based autoregressive model
-│   ├── test.py                # Inference/evaluation script
-│   ├── tokenizer.py           # SMILES tokenizer
-│   └── train.py               # Training script
+│   ├── callbacks.py             # Callbacks (checkpoint and SwanLab logging)
+│   ├── config.py                # Default configuration
+│   ├── config_local.py.example  # Example local configuration 
+│   ├── data.py                  # MergedDataset data loading
+│   ├── model.py                 # T5-based autoregressive model
+│   ├── test.py                  # Inference/evaluation script
+│   ├── tokenizer.py             # SMILES tokenizer
+│   └── train.py                 # Training script
 └── assets/
-    └── main.png               # Framework diagram
+    └── main.png                 # Framework diagram
 ```
 
 ## 📝 Citation
