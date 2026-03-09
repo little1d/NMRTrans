@@ -1,10 +1,10 @@
 #!/bin/bash
 
 rjob submit \
-    --name=0116-spec2smi-rl-r3 \
-    --gpu=8 \
-    --memory=1200000 \
-    --cpu=32 \
+    --name=nmrtrans \
+    --gpu=2 \
+    --memory=800000 \
+    --cpu=16 \
     --charged-group=ai4chem_gpu \
     --private-machine=group \
     --mount=gpfs://gpfs1/yangzhuo:/mnt/shared-storage-user/yangzhuo \
@@ -13,4 +13,4 @@ rjob submit \
     --host-network=true \
     --custom-resources brainpp.cn/fuse=1 \
     -e DISTRIBUTED_JOB=true \
-    -- bash -exc "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/scripts/start_training.sh"
+    -- bash -exc "/mnt/shared-storage-user/yangzhuo/main/projects/NMRTrans/scripts/start_training.sh"

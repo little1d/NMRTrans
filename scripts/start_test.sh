@@ -1,18 +1,16 @@
 #!/bin/bash
 
-# Quick start script for Spectra2Smiles training
+# Quick start script for Spectra2Smiles testing
 # Simple version without extensive checks
 
-# Activate conda environment and run training
+# Activate conda environment and run testing
 echo "Activating Conda environment..."
 source /mnt/shared-storage-user/yangzhuo/miniconda3/etc/profile.d/conda.sh
 conda activate spec2smi
 
-echo "Cleaning up GPU memory before training..."
-pkill -9 -f train.py 2>/dev/null
+echo "Cleaning up GPU memory before testing..."
+pkill -9 -f test.py 2>/dev/null
 sleep 2
-
-swanlab login --host http://100.103.234.34:8001 --relogin -k PGXG66CPWHASFqnS6irMr
 
 echo "Checking CUDA version..."
 nvcc -V
@@ -20,5 +18,5 @@ nvcc -V
 # Change to project directory
 cd "$(dirname "$0")/.."
 
-# Run the training
-python src/train.py
+# Run the testing
+python src/test.py --ckpt_path checkpoints/ar-epoch=1661-valacc=val_seq_acc=0.5000.ckpt
