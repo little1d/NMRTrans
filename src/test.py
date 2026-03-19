@@ -39,6 +39,15 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 warnings.filterwarnings("ignore")
 
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("torch.distributed").setLevel(logging.ERROR)
+logging.getLogger("RDKit").setLevel(logging.ERROR)
+
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 避免 tokenizer 警告
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -188,9 +197,60 @@ def parse_chemical_formula_to_vector(formula: str, atom_mapping: dict) -> torch.
     
     return vec
 
+def pad_j_coupling(j_coupling_list, max_j=6):
+    """Pad J-coupling list to fixed length"""
+    if not isinstance(j_coupling_list, list):
+        j_coupling_list = []
+    
+    padded = [0.0] * max_j
+    for i, val in enumerate(j_coupling_list[:max_j]):
+        try:
+            padded[i] = float(val)
+        except (TypeError, ValueError):
+            padded[i] = 0.0
+    return padded
+
+
+def prepare_h_nmr_features(tokenized_input_str, split_vocab):
+    """Prepare 1HNMR features from tokenized_input string (with width)"""
+    try:
+        tokenized_input = json.loads(tokenized_input_str)
+        h_nmr_data = tokenized_input.get("1HNMR", [])
+        
+        features = []
+        for peak in h_nmr_data:
+            if len(peak) < 5:
+                continue
+            
+            chem_shift = float(peak[0])
+            peak_width = float(peak[1])  # ✅ width as float
+            
+            # ✅ 使用传入的 split_vocab（支持动态词汇表）
+            split_str = str(peak[2]).strip().lower() if len(peak) > 2 else "<unk>"
+            split_idx = split_vocab.get(split_str, split_vocab.get('<unk>', 0))
+            
+            integral_str = str(peak[3]).strip() if len(peak) > 3 else '1H'
+            integral_value = 1.0
+            match = re.search(r'(\d+)(?:H|h)?', integral_str)
+            if match:
+                integral_value = float(match.group(1))
+            
+            j_coupling = peak[4] if len(peak) > 4 and isinstance(peak[4], list) else []
+            padded_j = pad_j_coupling(j_coupling)
+            
+            # 10 维特征: [chem_shift, width, split_idx, integral, j1-j6]
+            peak_features = [chem_shift, peak_width, split_idx, integral_value] + padded_j
+            features.append(peak_features)
+        
+        return features
+        
+    except Exception as e:
+        logger.warning(f"Error preparing H-NMR features: {str(e)}")
+        return []
+
 def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_features=None):
     """
-    Collate function for NMR peak datasets
+    Collate function for NMR peak datasets (updated for 10-dim H-NMR input)
     
     Args:
         batch: List of samples
@@ -199,6 +259,10 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_featur
         atom_mapping: Atom mapping for formula encoding (optional)
         enabled_features: Set of enabled features, e.g., {'c_nmr', 'h_nmr', 'formula'}
                         If None, processes all available features
+    
+    H-NMR Feature Format (10 dimensions):
+        [chem_shift, peak_width, split_idx, integral_value, j1, j2, j3, j4, j5, j6]
+         0           1            2          3              4-9
     """
     batch = [b for b in batch if b is not None]
     if not batch:
@@ -230,26 +294,60 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_featur
     # 2. Process spectrum data (only for enabled features)
     spectra_data = {}
     
-    # H-NMR processing
-    if 'h_nmr' in enabled_features and "h_nmr_peaks" in batch[0] and batch[0]["h_nmr_peaks"] is not None:
-        h_peaks_list = []
+    # ✅ UPDATED: Load split vocabulary from config (dynamic, matches training data)
+    try:
+        from config.split_vocab import SPLIT_VOCAB
+        split_vocab = SPLIT_VOCAB
+    except ImportError:
+        # Fallback: use hardcoded vocab (should match your generated vocab)
+        split_vocab = {
+            "<unk>": 0, "m": 1, "d": 2, "s": 3, "dd": 4, "t": 5, "ddd": 6, "q": 7, 
+            "dt": 8, "br": 9, "dq": 10, "ddt": 11, "tt": 12, "sept": 13, "dm": 14, "oct": 15
+        }
+    
+    # H-NMR processing (using prepare_h_nmr_features like training code)
+    if 'h_nmr' in enabled_features and any("tokenized_input" in item for item in batch):
+        h_features_list = []
+        max_peaks = 0
+        
         for item in batch:
-            if item["h_nmr_peaks"] is not None and len(item["h_nmr_peaks"]) > 0:
-                h_peaks = torch.tensor(item["h_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
-                h_peaks_list.append(h_peaks)
-            else:
-                h_peaks_list.append(torch.zeros((0, 1)))
-        h_peaks_padded, h_mask = pad_peak_sequences(h_peaks_list, config.MAX_PEAKS)
-        spectra_data["h_nmr_peaks"] = h_peaks_padded
+            tokenized_input_str = item.get("tokenized_input", "")
+            h_features = prepare_h_nmr_features(tokenized_input_str, split_vocab)
+            max_peaks = max(max_peaks, len(h_features))
+            h_features_list.append(h_features)
+        
+        # Pad to config.MAX_PEAKS
+        max_peaks = min(max_peaks, config.MAX_PEAKS)
+        
+        # ✅ UPDATED: Create tensor (B, L, 10) where 10 = [chem_shift, width, split_idx, integral, j1-j6]
+        H_NMR_FEATURE_DIM = 10  # ← Updated from 9 to 10
+        h_features_tensor = torch.zeros(len(batch), max_peaks, H_NMR_FEATURE_DIM)
+        h_mask = torch.zeros(len(batch), max_peaks, dtype=torch.long)
+        
+        for i, features in enumerate(h_features_list):
+            num_peaks = min(len(features), max_peaks)
+            if num_peaks > 0:
+                for j in range(num_peaks):
+                    # ✅ Ensure feature dimension matches
+                    if len(features[j]) == H_NMR_FEATURE_DIM:
+                        h_features_tensor[i, j] = torch.tensor(features[j])
+                    else:
+                        logger.warning(f"Feature dimension mismatch: expected {H_NMR_FEATURE_DIM}, got {len(features[j])}")
+                h_mask[i, :num_peaks] = 1
+        
+        spectra_data["h_nmr_features"] = h_features_tensor
         spectra_data["h_nmr_mask"] = h_mask
     
-    # C-NMR processing
+    # C-NMR processing (with normalization like training code)
     if 'c_nmr' in enabled_features and "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
         c_peaks_list = []
         for item in batch:
             if item["c_nmr_peaks"] is not None and len(item["c_nmr_peaks"]) > 0:
-                c_peaks = torch.tensor(item["c_nmr_peaks"], dtype=torch.float).unsqueeze(-1)
-                c_peaks_list.append(c_peaks)
+                c_peaks_tensor = torch.tensor(item["c_nmr_peaks"], dtype=torch.float)
+                # Normalize to [0, 1] range (same as training code)
+                c_peaks_tensor = c_peaks_tensor.unsqueeze(-1)
+                c_peaks_tensor = torch.clamp(c_peaks_tensor / 220.0, 0.0, 1.0)
+                c_peaks_list.append(c_peaks_tensor)
             else:
                 c_peaks_list.append(torch.zeros((0, 1)))
         c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
@@ -331,12 +429,13 @@ def build_test_dataloader(config: TrainingConfig, tokenizer, test_file=None, ena
         enabled_features=enabled_features
     )
     
+    # Use num_workers=0 for testing to avoid multiprocessing issues in container environments
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.TEST_BATCH_SIZE,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=config.NUM_DATA_WORKERS if config.NUM_DATA_WORKERS > 0 else 0,
+        num_workers=0,  # Disable multiprocessing to avoid "Address already in use" errors
         pin_memory=True,
     )
     
@@ -588,7 +687,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
             
             # Get inputs based on enabled features
             c_peaks = batch.get("c_nmr_peaks") if 'c_nmr' in enabled_features else None
-            h_peaks = batch.get("h_nmr_peaks") if 'h_nmr' in enabled_features else None
+            h_features = batch.get("h_nmr_features") if 'h_nmr' in enabled_features else None
             c_nmr_mask = batch.get("c_nmr_mask") if 'c_nmr' in enabled_features else None
             h_nmr_mask = batch.get("h_nmr_mask") if 'h_nmr' in enabled_features else None
             formula_vector = batch.get("formula_vector") if 'formula' in enabled_features else None
@@ -602,7 +701,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                 labels[labels == config.PAD_TOKEN_ID] = -100
                 tf_outputs = model_module(
                     c_peaks=c_peaks,
-                    h_peaks=h_peaks,
+                    h_features=h_features,
                     formula_vector=formula_vector,
                     smiles_ids=labels,
                     c_nmr_mask=c_nmr_mask,
@@ -624,7 +723,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                 # Generate sequences using greedy decoding
                 generated_ids = model_module.generate(
                     c_peaks=c_peaks,
-                    h_peaks=h_peaks,
+                    h_features=h_features,
                     formula_vector=formula_vector,
                     max_length=config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS,
                     c_nmr_mask=c_nmr_mask,
@@ -635,7 +734,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                 # 额外：Beam search 获取 top-k 序列（用于 top3/5/10 seq acc）
                 beam_generated_ids = model_module.generate(
                     c_peaks=c_peaks,
-                    h_peaks=h_peaks,
+                    h_features=h_features,
                     formula_vector=formula_vector,
                     max_length=config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS,
                     num_beams=max_beam,
@@ -682,22 +781,26 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     )
                     gen_content_len = gen_valid_mask.sum().item()
                     
-                    # Align to minimum content length
+                    # Get content tokens (excluding special tokens)
+                    true_content = true_tokens[valid_mask]
+                    gen_content = gen_tokens[gen_valid_mask]
+                    
+                    # Token accuracy: compare aligned sequences
                     min_content_len = min(true_content_len, gen_content_len)
                     
                     if min_content_len > 0:
-                        # Get content tokens (excluding special tokens)
-                        true_content = true_tokens[valid_mask][:min_content_len]
-                        gen_content = gen_tokens[gen_valid_mask][:min_content_len]
-                        
-                        # Token accuracy
-                        correct = (true_content == gen_content)
+                        # Compare up to minimum length
+                        true_content_compare = true_content[:min_content_len]
+                        gen_content_compare = gen_content[:min_content_len]
+                        correct = (true_content_compare == gen_content_compare)
                         token_acc = correct.sum().float() / min_content_len
-                        
-                        # Sequence accuracy (exact match of content)
-                        seq_acc = correct.all().item()
                     else:
                         token_acc = torch.tensor(0.0)
+                    
+                    # Sequence accuracy: exact match requires same length AND all tokens match
+                    if true_content_len == gen_content_len and true_content_len > 0:
+                        seq_acc = (true_content == gen_content).all().item()
+                    else:
                         seq_acc = 0.0
                     
                     # SMILES validity

@@ -170,6 +170,7 @@ class TrainingConfig:
     EPOCHS = _get_config("EPOCHS", 8000)
     GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
     ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
+    WEIGHT_DECAY = _get_config("WEIGHT_DECAY", 0.1)
     
     # Data loading
     NUM_DATA_WORKERS = _get_config("NUM_DATA_WORKERS", 8)
