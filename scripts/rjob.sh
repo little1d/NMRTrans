@@ -1,10 +1,10 @@
 #!/bin/bash
 
 rjob submit \
-    --name=nmrtrans \
-    --gpu=2 \
+    --name=nmrtrans-datalab \
+    --gpu=4 \
     --memory=800000 \
-    --cpu=16 \
+    --cpu=32 \
     --charged-group=ai4chem_gpu \
     --private-machine=group \
     --mount=gpfs://gpfs1/yangzhuo:/mnt/shared-storage-user/yangzhuo \

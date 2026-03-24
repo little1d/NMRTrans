@@ -1,7 +1,6 @@
 # Directories to ignore
 playground/
 checkpoints/
-cache/
 __pycache__/
 *.pyc
 .vscode/

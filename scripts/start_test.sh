@@ -16,7 +16,7 @@ echo "Checking CUDA version..."
 nvcc -V
 
 # Change to project directory
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.."a few 
 
 # Run the testing
 python src/test.py --ckpt_path checkpoints/ar-epoch=1661-valacc=val_seq_acc=0.5000.ckpt
