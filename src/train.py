@@ -18,6 +18,17 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"        # 禁用 Hugging Face Hub
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"  # 禁用进度条
 
+warnings.filterwarnings("ignore")
+
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("torch.distributed").setLevel(logging.ERROR)
+logging.getLogger("RDKit").setLevel(logging.ERROR)
+
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 避免 tokenizer 警告
+
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -150,37 +161,34 @@ def pad_j_coupling(j_coupling_list, max_j=6):
     return padded
 
 def prepare_h_nmr_features(tokenized_input_str, split_vocab):
-    """Prepare 1HNMR features from tokenized_input string"""
+    """Prepare 1HNMR features from tokenized_input string (with width)"""
     try:
         tokenized_input = json.loads(tokenized_input_str)
         h_nmr_data = tokenized_input.get("1HNMR", [])
         
         features = []
         for peak in h_nmr_data:
-            if len(peak) < 4:
+            if len(peak) < 5:
                 continue
             
-            # 1. chemical_shift (numeric)
             chem_shift = float(peak[0])
+            peak_width = float(peak[1])  # ✅ width as float
             
-            # 2. split pattern (discrete token)
+            # ✅ 使用传入的 split_vocab（支持动态词汇表）
             split_str = str(peak[2]).strip().lower() if len(peak) > 2 else "<unk>"
-            split_idx = split_vocab.get(split_str, 0)  # 0 is "<unk>" index
+            split_idx = split_vocab.get(split_str, split_vocab.get('<unk>', 0))
             
-            # 3. integral (numeric)
             integral_str = str(peak[3]).strip() if len(peak) > 3 else '1H'
-            # Extract number before 'H'
             integral_value = 1.0
             match = re.search(r'(\d+)(?:H|h)?', integral_str)
             if match:
                 integral_value = float(match.group(1))
             
-            # 4. J-coupling (6 numeric values, padded)
             j_coupling = peak[4] if len(peak) > 4 and isinstance(peak[4], list) else []
             padded_j = pad_j_coupling(j_coupling)
             
-            # Combine all features: [chem_shift, split_idx, integral_value, j1-j6]
-            peak_features = [chem_shift, split_idx, integral_value] + padded_j
+            # 10 维特征: [chem_shift, width, split_idx, integral, j1-j6]
+            peak_features = [chem_shift, peak_width, split_idx, integral_value] + padded_j
             features.append(peak_features)
         
         return features
@@ -219,9 +227,14 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
     spectra_data = {}
     
     # 定义split词汇表
+    # split_vocab = {
+    #     "<unk>": 0, "m": 1, "d": 2, "s": 3, "dd": 4, "t": 5, "ddd": 6, "q": 7, 
+    #     "dt": 8, "br": 9, "dq": 10, "ddt": 11, "tt": 12, "sept": 13, "dm": 14, "oct": 15
+    # }
     split_vocab = {
-        "<unk>": 0, "m": 1, "d": 2, "s": 3, "dd": 4, "t": 5, "ddd": 6, "q": 7, 
-        "dt": 8, "br": 9, "dq": 10, "ddt": 11, "tt": 12, "sept": 13, "dm": 14, "oct": 15
+        '<unk>': 0, 'm': 1, 'd': 2, 's': 3, 'dd': 4, 't': 5, 'ddd': 6, 'q': 7,
+        'dt': 8, 'td': 9, 'br': 10, 'ddt': 11, 'dq': 12, 'tt': 13, 'quint': 14,
+        'dddd': 15, 'qd': 16, 'sept': 17, 'ddp': 18, 'ddq': 19, 'bd': 20, 'dqd': 21,
     }
     
     # C-NMR处理
@@ -278,11 +291,20 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
         h_features_tensor = torch.zeros(len(batch), max_peaks, 9)
         h_mask = torch.zeros(len(batch), max_peaks, dtype=torch.long)
         
+        # ✅ 修改为（10 维）:
+        H_NMR_FEATURE_DIM = 10  # [chem_shift, width, split_idx, integral, j1-j6]
+        h_features_tensor = torch.zeros(len(batch), max_peaks, H_NMR_FEATURE_DIM)
+        h_mask = torch.zeros(len(batch), max_peaks, dtype=torch.long)
+
         for i, features in enumerate(h_features_list):
             num_peaks = min(len(features), max_peaks)
             if num_peaks > 0:
                 for j in range(num_peaks):
-                    h_features_tensor[i, j] = torch.tensor(features[j])
+                    # ✅ 确保 features[j] 长度为 10
+                    if len(features[j]) == H_NMR_FEATURE_DIM:
+                        h_features_tensor[i, j] = torch.tensor(features[j])
+                    else:
+                        logger.warning(f"Feature dimension mismatch: expected {H_NMR_FEATURE_DIM}, got {len(features[j])}")
                 h_mask[i, :num_peaks] = 1
         
         spectra_data["h_nmr_features"] = h_features_tensor

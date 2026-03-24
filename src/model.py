@@ -232,14 +232,15 @@ class SetTransformerPeakEncoder(nn.Module):
 
 class SetTransformer1HNMRPeakEncoder(nn.Module):
     """
-    Specialized Set Transformer Encoder for 1HNMR peaks with 4 features:
-    1. chemical_shift (numeric)
-    2. split_pattern (discrete token)
-    3. integral (numeric) 
-    4. J-coupling (6 numeric values, padded)
+    Specialized Set Transformer Encoder for 1HNMR peaks with 5 features:
+    1. chemical_shift (numeric, ppm)
+    2. peak_width     (numeric, ppm)  ← NEW: width/range of complex peaks
+    3. split_pattern  (discrete token, embedded)
+    4. integral       (numeric, H count)
+    5. J-coupling     (6 numeric values, padded)
     
-    Input format for each peak: [chem_shift, split_idx, integral_value, j1, j2, j3, j4, j5, j6]
-    Total input dimension: 9 features
+    Input format for each peak: [chem_shift, peak_width, split_idx, integral_value, j1, j2, j3, j4, j5, j6]
+    Total input dimension: 10 features (2 numeric + 1 embedded + 1 numeric + 6 numeric)
     """
     def __init__(self, d_model=512, n_heads=8, num_inds=32, num_seeds=32,
                  n_layers=3, ff_dim=1024, dropout=0.1, max_peaks=60,
@@ -254,9 +255,9 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
         self.split_embedding = nn.Embedding(split_vocab_size, d_model // 4)
         
         # 2. Input projection for continuous features
-        # Continuous features: chemical_shift, integral, 6 J-coupling values = 8 features total
+        # ✅ UPDATED: Continuous features = chem_shift(1) + width(1) + integral(1) + J(6) = 9 features
         self.continuous_proj = nn.Sequential(
-            nn.Linear(8, d_model // 2),
+            nn.Linear(9, d_model // 2),  # ← 8 → 9
             nn.ReLU(),
             nn.LayerNorm(d_model // 2),
             nn.Dropout(dropout),
@@ -296,80 +297,79 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
     def shuffle_peaks(self, peaks, mask=None):
         """
         仅在 mask=1 的有效位置内打乱 peaks，mask 本身保持不变
-        
-        Args:
-            peaks: Tensor of shape (B, L, D) - NMR 峰特征
-            mask:  Tensor of shape (B, L)   - 1=有效峰, 0=padding
-        
-        Returns:
-            shuffled_peaks: Tensor of shape (B, L, D)，仅有效峰内部顺序随机化
         """
         B, L, D = peaks.shape
-        shuffled_peaks = peaks.clone()  # 避免原地修改
+        shuffled_peaks = peaks.clone()
         
-        # 逐样本处理（batch size 通常较小，循环开销可忽略）
         for i in range(B):
-            valid_idx = torch.where(mask[i])[0]  # (k,) 有效位置索引
+            valid_idx = torch.where(mask[i])[0]
             k = len(valid_idx)
-            
-            if k > 1:  # 至少2个有效峰才需要打乱
-                # 生成有效位置内的随机排列
+            if k > 1:
                 perm = torch.randperm(k, device=peaks.device)
-                shuffled_idx = valid_idx[perm]   # 打乱后的有效位置
-                
-                # 将原有效峰按新顺序放回原有效位置
+                shuffled_idx = valid_idx[perm]
                 shuffled_peaks[i, valid_idx] = peaks[i, shuffled_idx]
-            # k <= 1 时无需打乱（单峰或无峰）
-        # shuffled_peaks = torch.zeros(peaks.shape, device=peaks.device)
         return shuffled_peaks
     
     def forward(self, peaks, mask=None):
         """
-        peaks: (B, L, 9) - 1HNMR features [chem_shift, split_idx, integral, j1-j6]
-        mask: (B, L) - 1表示有效峰，0表示padding
-        Returns: (B, L, d_model) - 峰特征编码
+        peaks: (B, L, 10) - 1HNMR features [chem_shift, width, split_idx, integral, j1-j6]
+        mask:  (B, L)     - 1=valid peak, 0=padding
+        Returns: 
+            X: (B, L, d_model) - per-peak encoded features
+            global_repr: (B, num_seeds, d_model) - global representation via PMA
+            mask: (B, L) - boolean mask
         """
         if peaks is None:
-            return None
+            return None, None, None
 
         if mask is None:
             mask = (peaks.abs().sum(-1) > 1e-6).long()
         
+        # Optional: shuffle peaks within valid positions (for augmentation)
         # peaks = self.shuffle_peaks(peaks, mask)
+        
         batch_size, seq_len, feat_dim = peaks.shape
         device = peaks.device
         
-        # 1. Separate features
-        chem_shift = peaks[..., 0:1]  # (B, L, 1)
-        split_idx = peaks[..., 1].long()  # (B, L)
-        integral = peaks[..., 2:3]  # (B, L, 1)
-        j_coupling = peaks[..., 3:9]  # (B, L, 6) - already padded to 6 values
+        # ✅ UPDATED: Separate 10-dim features
+        chem_shift = peaks[..., 0:1]    # (B, L, 1) - index 0
+        peak_width = peaks[..., 1:2]    # (B, L, 1) - index 1 ← NEW
+        split_idx = peaks[..., 2].long()  # (B, L)   - index 2 (was 1)
+        integral = peaks[..., 3:4]      # (B, L, 1) - index 3 (was 2)
+        j_coupling = peaks[..., 4:10]   # (B, L, 6) - indices 4-9 (was 3-8)
         
-        # 2. Process continuous features
-        continuous_features = torch.cat([chem_shift, integral, j_coupling], dim=-1)  # (B, L, 8)
+        # ✅ UPDATED: Concatenate continuous features (9 total)
+        continuous_features = torch.cat([
+            chem_shift,    # 1
+            peak_width,    # 1 ← NEW
+            integral,      # 1
+            j_coupling     # 6
+        ], dim=-1)  # (B, L, 9)
+        
+        # Project continuous features
         continuous_proj = self.continuous_proj(continuous_features)  # (B, L, d_model)
         
-        # 3. Process split pattern features
+        # Process split pattern features
         split_embed = self.split_embedding(split_idx)  # (B, L, d_model//4)
         
-        # 4. Fuse features
-        fused_features = torch.cat([continuous_proj, split_embed], dim=-1)  # (B, L, d_model + d_model//4)
+        # Fuse features
+        fused_features = torch.cat([continuous_proj, split_embed], dim=-1)  # (B, L, 5d_model/4)
         X = self.feature_fusion(fused_features)  # (B, L, d_model)
         
-        # 5. Apply mask
+        # Apply mask
         pad_mask = ~mask.bool()
         if pad_mask.any():
             pad_tokens = self.pad_token.expand(batch_size, seq_len, -1)
             X = torch.where(pad_mask.unsqueeze(-1), pad_tokens, X)
         
-        # 6. Set Transformer encoding
+        # Set Transformer encoding
         for isab_layer in self.isab_layers:
             X = isab_layer(X, mask=pad_mask if pad_mask.any() else None)
         
-        # 7. PMA for global representation
+        # PMA for global representation
         global_repr = self.pma(X, mask=pad_mask if pad_mask.any() else None)  # (B, num_seeds, d_model)
         
-        # 8. Output projection
+        # Output projection
         X = self.output_proj(X)  # (B, L, d_model)
         
         return X, global_repr, mask.bool()
@@ -553,8 +553,9 @@ class NMR2SMILESModel(pl.LightningModule):
         
         # 定义split词汇表
         self.split_vocab = [
-            "<unk>", "m", "d", "s", "dd", "t", "ddd", "q", "dt", 
-            "br", "dq", "ddt", "tt", "sept", "dm", "oct"
+        '<unk>', 'm', 'd', 's', 'dd', 't', 'ddd', 'q',
+        'dt', 'td', 'br', 'ddt', 'dq', 'tt', 'quint',
+        'dddd', 'qd', 'sept', 'ddp', 'ddq', 'bd', 'dqd',
         ]
         self.split_to_idx = {token: idx for idx, token in enumerate(self.split_vocab)}
         
@@ -792,7 +793,21 @@ class NMR2SMILESModel(pl.LightningModule):
             logger.warning(f"NaN detected in c_peaks at batch {batch_idx}")
         if h_features is not None and torch.isnan(h_features).any():
             logger.warning(f"NaN detected in h_features at batch {batch_idx}")
-        
+
+        # if self.training:
+        #     # C-NMR: 归一化空间加噪声 (约 1-2 ppm 等效)
+        #     if c_peaks is not None and c_nmr_mask is not None:
+        #         noise = torch.randn_like(c_peaks) * 0.005  # ✅ 归一化尺度
+        #         c_peaks = c_peaks + noise
+        #         c_peaks = torch.clamp(c_peaks, 0.0, 1.0)  # 保持范围
+            
+        #     # H-NMR: 化学位移加噪声 (约 0.1 ppm 等效)
+        #     if h_features is not None and h_nmr_mask is not None:
+        #         h_shift_noise = torch.randn_like(h_features[:, :, 0:1]) * 0.08  # ✅ 归一化尺度
+        #         h_features = h_features.clone()  # 避免 inplace 操作
+        #         h_features[:, :, 0:1] = h_features[:, :, 0:1] + h_shift_noise
+        #         h_features[:, :, 0:1] = torch.clamp(h_features[:, :, 0:1], 0.0, 1.0)
+                
         # T5 expects labels with -100 for positions to ignore
         labels = smiles_ids.clone()
         labels[labels == self.config.PAD_TOKEN_ID] = -100
@@ -897,143 +912,197 @@ class NMR2SMILESModel(pl.LightningModule):
         return acc, valid, similarity
     
     def validation_step(self, batch, batch_idx):
-        """Validation step with autoregressive generation and RDKit evaluation."""
+        """
+        Validation step with autoregressive generation and RDKit evaluation.
+        ✅ 修复：对整个 batch 进行生成评估，而不是只取第 1 个样本
+        """
         if batch_idx == 0 and self.global_rank == 0:
             logger.info(f"\n{'='*80}")
             logger.info(f"Starting validation at epoch {self.current_epoch}")
             logger.info(f"{'='*80}")
         
         smiles_ids = batch["smiles"].long()
+        original_smiles_list = batch["original_smiles"]
+        batch_size = smiles_ids.size(0)
         
         # 根据配置获取输入（消融实验）
         c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
         c_nmr_mask = batch.get("c_nmr_mask") if self.c_encoder is not None else None
-        
-        # 获取预处理的1HNMR特征
         h_features = batch.get("h_nmr_features") if self.h_encoder is not None else None
         h_nmr_mask = batch.get("h_nmr_mask") if self.h_encoder is not None else None
-        
-        original_smiles_list = batch["original_smiles"]
         formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
         
-        # Teacher forcing evaluation
+        # ========== Teacher Forcing 评估（Token 级别）==========
         labels = smiles_ids.clone()
         labels[labels == self.config.PAD_TOKEN_ID] = -100
         
         with torch.no_grad():
             outputs = self(
                 c_peaks=c_peaks,
-                h_peaks=None,  # Not used directly
+                h_features=h_features,
                 formula_vector=formula_vector,
                 smiles_ids=labels,
                 c_nmr_mask=c_nmr_mask,
                 h_nmr_mask=h_nmr_mask,
-                h_features=h_features,  # Pass preprocessed features
             )
-            
             logits = outputs.logits
             pred_tokens = logits.argmax(dim=-1)
             
             # Token accuracy
             valid_mask = (smiles_ids != self.config.PAD_TOKEN_ID)
             correct = (pred_tokens == smiles_ids) & valid_mask
-            token_acc = correct.sum().float() / valid_mask.sum().float()
-        self.log("val_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
+            token_acc = correct.sum().float() / valid_mask.sum().float() if valid_mask.sum() > 0 else torch.tensor(0.0, device=self.device)
+            self.log("val_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
         
-        # Generation & Evaluation with RDKit (BATCH)
+        # ========== 自回归生成评估（整个 Batch）==========
         val_mol_acc = torch.tensor(0.0, device=self.device)
         val_validity = torch.tensor(0.0, device=self.device)
         val_similarity = torch.tensor(0.0, device=self.device)
-        
-        # Default seq_acc to 0.0 (if generation fails completely)
         seq_acc = torch.tensor(0.0, device=self.device)
+        samples_evaluated = 0
         
         try:
-            # Prepare generation inputs
-            gen_c_peaks = c_peaks[:1] if c_peaks is not None else None
-            gen_c_mask = c_nmr_mask[:1] if c_nmr_mask is not None else None
-            gen_h_features = h_features[:1] if h_features is not None else None
-            gen_h_mask = h_nmr_mask[:1] if h_nmr_mask is not None else None
-            gen_formula = formula_vector[:1] if formula_vector is not None else None
-            
+            # ✅ 修复：对整个 batch 进行生成，不是 [:1]
             generated_ids = self.generate(
-                c_peaks=gen_c_peaks,
-                h_peaks=None,  # Not used directly
-                formula_vector=gen_formula,
-                h_features=gen_h_features,
-                c_nmr_mask=gen_c_mask,
-                h_nmr_mask=gen_h_mask,
-                max_length=self.config.MAX_SMILES_LENGTH + 5,
-                num_beams=1, # Greedy decoding for validation speed
+                c_peaks=c_peaks,
+                h_features=h_features,
+                formula_vector=formula_vector,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
+                max_length=self.config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS,
+                num_beams=1,
                 do_sample=False
             )
             
-            acc_list = []
-            valid_list = []
-            sim_list = []
-            
-            # Suppress RDKit error logs during evaluation to avoid flooding console with invalid SMILES errors
+            acc_list, valid_list, sim_list = [], [], []
             rdBase.DisableLog('rdApp.error')
             try:
-                for i in range(len(generated_ids)):
-                    if i >= len(original_smiles_list): break
+                # ✅ 修复：遍历整个 batch，不是只评估第 1 个
+                for i in range(batch_size):
+                    if i >= len(original_smiles_list):
+                        break
+                    
                     pred_smiles = self.tokens_to_smiles(generated_ids[i])
                     true_smiles = original_smiles_list[i]
                     acc, valid, sim = self.evaluate_smiles_pair(pred_smiles, true_smiles)
+                    
                     acc_list.append(acc)
                     valid_list.append(valid)
-                    sim_list.append(sim)
+                    if sim >= 0:
+                        sim_list.append(sim)
+                
+                samples_evaluated = len(acc_list)
+                
+                if len(acc_list) > 0:
+                    val_mol_acc = torch.tensor(acc_list, device=self.device).float().mean()
+                    val_validity = torch.tensor(valid_list, device=self.device).float().mean()
+                    seq_acc = val_mol_acc  # RDKit exact match
+                    
+                    if len(sim_list) > 0:
+                        val_similarity = torch.tensor(sim_list, device=self.device).float().mean()
+                
             finally:
                 rdBase.EnableLog('rdApp.error')
             
-            if len(valid_list) > 0:
-                val_mol_acc = torch.tensor(acc_list, device=self.device).float().mean()
-                val_validity = torch.tensor(valid_list, device=self.device).float().mean()
-                val_similarity = torch.tensor(sim_list, device=self.device).float().mean()
+            # ✅ 记录评估样本数量（用于调试）
+            self.log("val_samples_evaluated", float(samples_evaluated), prog_bar=False, logger=True)
             
-            # Update seq_acc to use RDKit exact match results
-            seq_acc = val_mol_acc
+            # ✅ 记录评估失败率（用于调试）
+            if batch_size > 0:
+                failure_rate = 1.0 - (samples_evaluated / batch_size)
+                self.log("val_eval_failure_rate", failure_rate, prog_bar=False, logger=True)
+            
         except Exception as e:
-            logger.warning(f"Validation generation/evaluation failed: {e}")
+            logger.warning(f"Validation generation/evaluation failed at batch {batch_idx}: {e}")
+            # 保持默认值 0.0
         
-        # Log metrics safely (Always logged)
-        self.log("val_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True) # Purely RDKit-based
+        # ========== 记录指标 ==========
+        self.log("val_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
         self.log("val_validity", val_validity, prog_bar=True, sync_dist=True, logger=True)
         self.log("val_similarity", val_similarity, prog_bar=True, sync_dist=True, logger=True)
         
-        # Generate and log examples
-        if batch_idx % 10 == 0 and self.global_rank == 0:
+        # ========== 记录示例（每 10 个 batch 记录一次）==========
+        if batch_idx % 10 == 0 and self.global_rank == 0 and samples_evaluated > 0:
             try:
-                # 根据配置安全地获取单个样本用于生成
-                gen_c_peaks = c_peaks[:1] if c_peaks is not None else None
-                gen_c_mask = c_nmr_mask[:1] if c_nmr_mask is not None else None
-                gen_h_features = h_features[:1] if h_features is not None else None
-                gen_h_mask = h_nmr_mask[:1] if h_nmr_mask is not None else None
-                gen_formula = formula_vector[:1] if formula_vector is not None else None
-                
-                generated = self.generate(
-                    c_peaks=gen_c_peaks,
-                    h_peaks=None,  # Not used directly
-                    h_features=gen_h_features,
-                    formula_vector=gen_formula,
-                    c_nmr_mask=gen_c_mask,
-                    h_nmr_mask=gen_h_mask,
-                )
-                generated_smiles = self.tokens_to_smiles(generated[0])
-                original_smiles = original_smiles_list[0]
-                logger.info(f"\n[Validation Example {batch_idx}]")
-                logger.info(f"Original:  {original_smiles}")
-                logger.info(f"Generated: {generated_smiles}")
-                self.validation_outputs.append({
-                    "original": original_smiles,
-                    "predicted_original": generated_smiles,
-                    "val_token_acc": token_acc.item(),
-                    "val_seq_acc": seq_acc.item(),
-                })
+                # 记录前 3 个样本的生成结果
+                for i in range(min(3, samples_evaluated)):
+                    pred_smiles = self.tokens_to_smiles(generated_ids[i])
+                    true_smiles = original_smiles_list[i]
+                    logger.info(f"\n[Validation Example {batch_idx}-{i}]")
+                    logger.info(f"Original:  {true_smiles}")
+                    logger.info(f"Generated: {pred_smiles}")
+                    logger.info(f"Match:     {pred_smiles == true_smiles}")
             except Exception as e:
-                logger.warning(f"Failed to generate validation example: {e}")
+                logger.warning(f"Failed to log validation example: {e}")
         
-        return {"val_token_acc": token_acc, "val_seq_acc": seq_acc}
+        # ========== 保存验证输出（用于 on_validation_epoch_end 聚合）==========
+        self.validation_outputs.append({
+            "val_token_acc": token_acc.item(),
+            "val_seq_acc": seq_acc.item(),
+            "val_validity": val_validity.item(),
+            "val_similarity": val_similarity.item(),
+            "samples_evaluated": samples_evaluated,
+            "batch_size": batch_size,
+        })
+        
+        return {
+            "val_token_acc": token_acc,
+            "val_seq_acc": seq_acc,
+            "val_validity": val_validity,
+            "val_similarity": val_similarity,
+            "samples_evaluated": torch.tensor(samples_evaluated, device=self.device),
+            "batch_size": torch.tensor(batch_size, device=self.device),
+        }
+
+    def on_validation_epoch_end(self):
+        """
+        在验证 epoch 结束时聚合所有 batch 的指标。
+        ✅ 确保 Lightning 记录的指标与实际测试结果一致
+        """
+        if not self.validation_outputs:
+            return
+        
+        # 聚合所有 batch 的指标
+        total_samples = sum(out["samples_evaluated"] for out in self.validation_outputs)
+        total_batch_size = sum(out["batch_size"] for out in self.validation_outputs)
+        
+        # 加权平均（按样本数）
+        if total_samples > 0:
+            avg_seq_acc = sum(
+                out["val_seq_acc"] * out["samples_evaluated"] 
+                for out in self.validation_outputs
+            ) / total_samples
+            
+            avg_validity = sum(
+                out["val_validity"] * out["samples_evaluated"] 
+                for out in self.validation_outputs
+            ) / total_samples
+            
+            avg_similarity = sum(
+                out["val_similarity"] * out["samples_evaluated"] 
+                for out in self.validation_outputs
+            ) / total_samples if any(out["val_similarity"] > 0 for out in self.validation_outputs) else 0.0
+        else:
+            avg_seq_acc = 0.0
+            avg_validity = 0.0
+            avg_similarity = 0.0
+        
+        # 记录聚合后的指标
+        self.log("val_seq_acc_epoch", avg_seq_acc, prog_bar=True, sync_dist=False, logger=True)
+        self.log("val_validity_epoch", avg_validity, prog_bar=True, sync_dist=False, logger=True)
+        self.log("val_similarity_epoch", avg_similarity, prog_bar=True, sync_dist=False, logger=True)
+        self.log("val_total_samples", float(total_samples), prog_bar=False, logger=True)
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Validation Epoch {self.current_epoch} Summary:")
+        logger.info(f"  Total Samples Evaluated: {total_samples} / {total_batch_size}")
+        logger.info(f"  Sequence Accuracy: {avg_seq_acc:.4f}")
+        logger.info(f"  Valid SMILES Ratio: {avg_validity:.4f}")
+        logger.info(f"  Tanimoto Similarity: {avg_similarity:.4f}")
+        logger.info(f"{'='*80}\n")
+        
+        # 清空输出列表
+        self.validation_outputs = []
     
     def generate(self, c_peaks=None, h_peaks=None, h_features=None, formula_vector=None, 
                 max_length=None, num_beams=1, do_sample=False, temperature=1.0, top_k=50, top_p=1.0, batch_size=None,
@@ -1226,7 +1295,7 @@ class NMR2SMILESModel(pl.LightningModule):
         optimizer = optim.AdamW(
             self.parameters(), 
             lr=self.config.LEARNING_RATE, 
-            weight_decay=0.01
+            weight_decay=self.config.WEIGHT_DECAY
         )
         
         # Use step-based warmup
