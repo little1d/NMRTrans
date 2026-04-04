@@ -375,6 +375,90 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
         return X, global_repr, mask.bool()
 
 # ===========================================================
+# GraphDecoder —— 从融合后的NMR表征直接预测图节点/边
+# 输出:
+#   node_hidden: (B, N, d_model)
+#   多个节点属性logits
+#   edge_logits: (B, N, N, edge_vocab_size)
+# ===========================================================
+class GraphDecoder(nn.Module):
+    def __init__(
+        self,
+        d_model=512,
+        n_heads=8,
+        n_layers=4,
+        ff_dim=2048,
+        dropout=0.1,
+        max_nodes=128,
+        atom_vocab_size=64,
+        charge_vocab_size=5,
+        hybrid_vocab_size=8,
+        chiral_vocab_size=4,
+        hydrogen_vocab_size=5,
+        edge_vocab_size=6,
+    ):
+        super().__init__()
+        self.max_nodes = max_nodes
+        self.node_queries = nn.Embedding(max_nodes, d_model)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
+        self.output_norm = nn.LayerNorm(d_model)
+
+        self.node_presence_head = nn.Linear(d_model, 1)
+        self.node_symbol_head = nn.Linear(d_model, atom_vocab_size)
+        self.node_charge_head = nn.Linear(d_model, charge_vocab_size)
+        self.node_aromatic_head = nn.Linear(d_model, 2)
+        self.node_hybrid_head = nn.Linear(d_model, hybrid_vocab_size)
+        self.node_chiral_head = nn.Linear(d_model, chiral_vocab_size)
+        self.node_hydrogen_head = nn.Linear(d_model, hydrogen_vocab_size)
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, edge_vocab_size),
+        )
+
+    def forward(self, encoder_hidden, attention_mask):
+        batch_size = encoder_hidden.size(0)
+        node_queries = self.node_queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        memory_key_padding_mask = None
+        if attention_mask is not None:
+            memory_key_padding_mask = ~attention_mask.bool()
+
+        node_hidden = self.decoder(
+            tgt=node_queries,
+            memory=encoder_hidden,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
+        node_hidden = self.output_norm(node_hidden)
+
+        pair_i = node_hidden.unsqueeze(2).expand(-1, -1, self.max_nodes, -1)
+        pair_j = node_hidden.unsqueeze(1).expand(-1, self.max_nodes, -1, -1)
+        edge_logits = self.edge_mlp(torch.cat([pair_i, pair_j], dim=-1))
+        edge_logits = 0.5 * (edge_logits + edge_logits.transpose(1, 2))
+
+        return {
+            "node_hidden": node_hidden,
+            "node_presence_logits": self.node_presence_head(node_hidden).squeeze(-1),
+            "node_symbol_logits": self.node_symbol_head(node_hidden),
+            "node_charge_logits": self.node_charge_head(node_hidden),
+            "node_aromatic_logits": self.node_aromatic_head(node_hidden),
+            "node_hybrid_logits": self.node_hybrid_head(node_hidden),
+            "node_chiral_logits": self.node_chiral_head(node_hidden),
+            "node_hydrogen_logits": self.node_hydrogen_head(node_hidden),
+            "edge_logits": edge_logits,
+        }
+
+# ===========================================================
 # 2. Multi-modal Fusion Layer —— 合并 CNMR + HNMR + guidance
 # ===========================================================
 
@@ -522,6 +606,7 @@ class NMR2SMILESModel(pl.LightningModule):
         self.config = config
         self.tokenizer = tokenizer
         self.vocab_size = len(tokenizer)
+        self.decoder_type = getattr(config, "DECODER_TYPE", "smiles")
         d_model = config.PEAK_ENCODER_D_MODEL
         
         # 消融实验：根据配置决定是否初始化 C/H encoder
@@ -608,51 +693,61 @@ class NMR2SMILESModel(pl.LightningModule):
         # Fusion
         self.fusion = FusionLayer(d_model=d_model)
 
-        # T5 用于 decoder-only（但依然 load 整个模型）
-        # Note: This loads the T5 architecture. Actual weights will be loaded from checkpoint.
-        logger.debug(f"Initializing T5 model architecture from: {config.T5_MODEL_NAME}")
-        if getattr(config, "USE_RANDOM_T5_INIT", False):
-            # 使用 T5Config 随机初始化（不加载预训练权重）
-            t5_config = T5Config.from_pretrained(
-                config.T5_MODEL_NAME,
-                local_files_only=True
+        if self.decoder_type == "graph":
+            self.graph_decoder = GraphDecoder(
+                d_model=d_model,
+                n_heads=config.GRAPH_DECODER_N_HEADS,
+                n_layers=config.GRAPH_DECODER_N_LAYERS,
+                ff_dim=config.GRAPH_DECODER_FF_DIM,
+                dropout=config.GRAPH_DECODER_DROPOUT,
+                max_nodes=config.GRAPH_MAX_NODES,
+                atom_vocab_size=len(getattr(config, "GRAPH_ATOM_VOCAB", ['C'])),
+                charge_vocab_size=len(getattr(config, "GRAPH_CHARGE_VALUES", [0])),
+                hybrid_vocab_size=len(getattr(config, "GRAPH_HYBRIDIZATION_VALUES", [0])),
+                chiral_vocab_size=len(getattr(config, "GRAPH_CHIRAL_TAG_VALUES", [0])),
+                hydrogen_vocab_size=len(getattr(config, "GRAPH_HYDROGEN_COUNT_VALUES", [0])),
+                edge_vocab_size=len(getattr(config, "GRAPH_EDGE_TYPES", ["S", "D", "T", "A", "UNK"])) + 1,
             )
-            t5_config.vocab_size = len(tokenizer)
-            self.t5 = T5ForConditionalGeneration(t5_config)
+            self.t5 = None
+            logger.info("✅ Graph decoder 已启用")
         else:
-            self.t5 = T5ForConditionalGeneration.from_pretrained(
-                config.T5_MODEL_NAME,
-                local_files_only=True  # Use local model files only, don't access network
-            )
-        
-        # 对齐 T5 的词表大小与自定义 SMILES tokenizer，确保 embedding / lm_head 尺寸一致
-        self._resize_t5_embeddings_to_tokenizer()
-        
-        if getattr(config, "REMOVE_CROSS_ATTENTION_POSITION_BIAS", False):
-            for layer in self.t5.decoder.block:
-                cross_attention = layer.layer[1].EncDecAttention
-                # 禁用位置偏置
-                cross_attention.has_relative_attention_bias = False
-                cross_attention.relative_attention_bias = None
-                # 可选：验证是否成功移除
-                print(f"Cross-attention position bias disabled: {cross_attention.has_relative_attention_bias}")
-        
-        # Log final embedding/LM head shapes for sanity check
-        embed_shape = tuple(self.t5.get_input_embeddings().weight.shape)
-        lm_head_shape = tuple(self.t5.lm_head.weight.shape)
-        logger.info(f"T5 embedding shape: {embed_shape}, LM head shape: {lm_head_shape}")
-        
-        # Set T5 to training mode
-        self.t5.train()
-        
-        # Optionally freeze T5 decoder
-        if config.FREEZE_T5_DECODER:
-            logger.info("Freezing T5 decoder parameters")
-            for param in self.t5.decoder.parameters():
-                param.requires_grad = False
-        
-        # Even if frozen, keep in train mode for other modules
-        self.t5.train()
+            self.graph_decoder = None
+
+            # T5 用于 decoder-only（但依然 load 整个模型）
+            logger.debug(f"Initializing T5 model architecture from: {config.T5_MODEL_NAME}")
+            if getattr(config, "USE_RANDOM_T5_INIT", False):
+                t5_config = T5Config.from_pretrained(
+                    config.T5_MODEL_NAME,
+                    local_files_only=True
+                )
+                t5_config.vocab_size = len(tokenizer)
+                self.t5 = T5ForConditionalGeneration(t5_config)
+            else:
+                self.t5 = T5ForConditionalGeneration.from_pretrained(
+                    config.T5_MODEL_NAME,
+                    local_files_only=True
+                )
+
+            self._resize_t5_embeddings_to_tokenizer()
+
+            if getattr(config, "REMOVE_CROSS_ATTENTION_POSITION_BIAS", False):
+                for layer in self.t5.decoder.block:
+                    cross_attention = layer.layer[1].EncDecAttention
+                    cross_attention.has_relative_attention_bias = False
+                    cross_attention.relative_attention_bias = None
+                    print(f"Cross-attention position bias disabled: {cross_attention.has_relative_attention_bias}")
+
+            embed_shape = tuple(self.t5.get_input_embeddings().weight.shape)
+            lm_head_shape = tuple(self.t5.lm_head.weight.shape)
+            logger.info(f"T5 embedding shape: {embed_shape}, LM head shape: {lm_head_shape}")
+            self.t5.train()
+
+            if config.FREEZE_T5_DECODER:
+                logger.info("Freezing T5 decoder parameters")
+                for param in self.t5.decoder.parameters():
+                    param.requires_grad = False
+
+            self.t5.train()
         
         # For logging
         self.validation_outputs = []
@@ -713,6 +808,164 @@ class NMR2SMILESModel(pl.LightningModule):
             logger.warning(f"Error preparing H-NMR features: {str(e)}")
             return []
 
+    def _encode_modalities(
+        self,
+        c_peaks=None,
+        h_features=None,
+        formula_vector=None,
+        c_nmr_mask=None,
+        h_nmr_mask=None,
+    ):
+        z_c = None
+        global_c = None
+        if self.c_encoder is not None and c_peaks is not None:
+            z_c, global_c, c_nmr_mask = self.c_encoder(c_peaks, mask=c_nmr_mask)
+
+        z_h = None
+        global_h = None
+        if self.h_encoder is not None and h_features is not None:
+            z_h, global_h, h_nmr_mask = self.h_encoder(h_features, mask=h_nmr_mask)
+
+        z_guidance = None
+        if self.formula_encoder is not None and formula_vector is not None:
+            z_guidance = self.formula_encoder(formula_vector)
+
+        encoder_hidden, attention_mask = self.fusion(
+            z_c,
+            z_h,
+            global_c,
+            global_h,
+            z_guidance,
+            c_mask=c_nmr_mask,
+            h_mask=h_nmr_mask,
+        )
+        return encoder_hidden, attention_mask
+
+    def _compute_graph_loss(self, graph_outputs, batch):
+        node_mask = batch["graph_node_mask"].bool()
+        node_presence_target = node_mask.float()
+        presence_loss = F.binary_cross_entropy_with_logits(
+            graph_outputs["node_presence_logits"],
+            node_presence_target,
+        )
+
+        masked_positions = node_mask
+        if masked_positions.any():
+            symbol_loss = F.cross_entropy(
+                graph_outputs["node_symbol_logits"][masked_positions],
+                batch["graph_node_symbol"][masked_positions],
+            )
+            charge_loss = F.cross_entropy(
+                graph_outputs["node_charge_logits"][masked_positions],
+                batch["graph_node_charge"][masked_positions],
+            )
+            aromatic_loss = F.cross_entropy(
+                graph_outputs["node_aromatic_logits"][masked_positions],
+                batch["graph_node_aromatic"][masked_positions],
+            )
+            hybrid_loss = F.cross_entropy(
+                graph_outputs["node_hybrid_logits"][masked_positions],
+                batch["graph_node_hybrid"][masked_positions],
+            )
+            chiral_loss = F.cross_entropy(
+                graph_outputs["node_chiral_logits"][masked_positions],
+                batch["graph_node_chiral"][masked_positions],
+            )
+            hydrogen_loss = F.cross_entropy(
+                graph_outputs["node_hydrogen_logits"][masked_positions],
+                batch["graph_node_hydrogen"][masked_positions],
+            )
+        else:
+            zero = presence_loss.new_zeros(())
+            symbol_loss = charge_loss = aromatic_loss = hybrid_loss = chiral_loss = hydrogen_loss = zero
+
+        pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+        pair_mask = torch.triu(pair_mask, diagonal=1)
+        if pair_mask.any():
+            edge_loss = F.cross_entropy(
+                graph_outputs["edge_logits"][pair_mask],
+                batch["graph_edge_labels"][pair_mask],
+            )
+        else:
+            edge_loss = presence_loss.new_zeros(())
+
+        total_loss = (
+            presence_loss
+            + symbol_loss
+            + 0.5 * charge_loss
+            + 0.5 * aromatic_loss
+            + 0.5 * hybrid_loss
+            + 0.5 * chiral_loss
+            + 0.5 * hydrogen_loss
+            + edge_loss
+        )
+        return {
+            "loss": total_loss,
+            "presence_loss": presence_loss,
+            "symbol_loss": symbol_loss,
+            "charge_loss": charge_loss,
+            "aromatic_loss": aromatic_loss,
+            "hybrid_loss": hybrid_loss,
+            "chiral_loss": chiral_loss,
+            "hydrogen_loss": hydrogen_loss,
+            "edge_loss": edge_loss,
+        }
+
+    def _compute_graph_metrics(self, graph_outputs, batch):
+        node_mask = batch["graph_node_mask"].bool()
+        pred_node_mask = graph_outputs["node_presence_logits"] > 0
+        node_presence_acc = (pred_node_mask == node_mask).float().mean()
+
+        masked_positions = node_mask
+        def _masked_acc(logits_key, target_key):
+            if not masked_positions.any():
+                return node_presence_acc.new_zeros(())
+            preds = graph_outputs[logits_key][masked_positions].argmax(dim=-1)
+            targets = batch[target_key][masked_positions]
+            return (preds == targets).float().mean()
+
+        node_symbol_acc = _masked_acc("node_symbol_logits", "graph_node_symbol")
+        node_charge_acc = _masked_acc("node_charge_logits", "graph_node_charge")
+        node_aromatic_acc = _masked_acc("node_aromatic_logits", "graph_node_aromatic")
+
+        pair_mask = node_mask.unsqueeze(1) & node_mask.unsqueeze(2)
+        pair_mask = torch.triu(pair_mask, diagonal=1)
+        if pair_mask.any():
+            edge_preds = graph_outputs["edge_logits"][pair_mask].argmax(dim=-1)
+            edge_targets = batch["graph_edge_labels"][pair_mask]
+            edge_acc = (edge_preds == edge_targets).float().mean()
+        else:
+            edge_acc = node_presence_acc.new_zeros(())
+
+        exact_nodes = pred_node_mask == node_mask
+        symbol_match = graph_outputs["node_symbol_logits"].argmax(dim=-1) == batch["graph_node_symbol"]
+        charge_match = graph_outputs["node_charge_logits"].argmax(dim=-1) == batch["graph_node_charge"]
+        aromatic_match = graph_outputs["node_aromatic_logits"].argmax(dim=-1) == batch["graph_node_aromatic"]
+        hybrid_match = graph_outputs["node_hybrid_logits"].argmax(dim=-1) == batch["graph_node_hybrid"]
+        chiral_match = graph_outputs["node_chiral_logits"].argmax(dim=-1) == batch["graph_node_chiral"]
+        hydrogen_match = graph_outputs["node_hydrogen_logits"].argmax(dim=-1) == batch["graph_node_hydrogen"]
+        node_exact = (~node_mask) | (
+            exact_nodes
+            & symbol_match
+            & charge_match
+            & aromatic_match
+            & hybrid_match
+            & chiral_match
+            & hydrogen_match
+        )
+        edge_match = graph_outputs["edge_logits"].argmax(dim=-1) == batch["graph_edge_labels"]
+        edge_exact = (~pair_mask) | edge_match
+        graph_exact = (node_exact.all(dim=1) & edge_exact.reshape(edge_exact.size(0), -1).all(dim=1)).float().mean()
+
+        return {
+            "node_presence_acc": node_presence_acc,
+            "node_symbol_acc": node_symbol_acc,
+            "node_charge_acc": node_charge_acc,
+            "node_aromatic_acc": node_aromatic_acc,
+            "edge_acc": edge_acc,
+            "graph_exact": graph_exact,
+        }
+
     def forward(
         self,
         c_peaks=None,
@@ -733,135 +986,92 @@ class NMR2SMILESModel(pl.LightningModule):
         h_features: preprocessed 1HNMR features tensor
           smiles_ids: tokenized smiles (labels)
         """
-        # 使用 PeakEncoder + Fusion（原始模式）
-        # C-NMR（根据配置和输入决定）
-        z_c = None
-        global_c = None
-        if self.c_encoder is not None and c_peaks is not None:
-            z_c, global_c, c_nmr_mask = self.c_encoder(c_peaks, mask=c_nmr_mask)
-        
-        # H-NMR（根据配置和输入决定）- 使用新特征
-        z_h = None
-        global_h = None
-        if self.h_encoder is not None and h_features is not None:
-            z_h, global_h, h_nmr_mask = self.h_encoder(h_features, mask=h_nmr_mask)
-        
-        # 新增：处理化学式guidance
-        z_guidance = None
-        if self.formula_encoder is not None and formula_vector is not None:
-            z_guidance = self.formula_encoder(formula_vector)  # (B, 1, d_model)
-        
-        # global_c = None
-        # global_h = None
-        # 融合 - 现在返回特征和对应的attention mask
-        encoder_hidden, attention_mask = self.fusion(
-            z_c, z_h,
-            global_c, global_h,
-            z_guidance,
-            c_mask=c_nmr_mask,
-            h_mask=h_nmr_mask
+        encoder_hidden, attention_mask = self._encode_modalities(
+            c_peaks=c_peaks,
+            h_features=h_features,
+            formula_vector=formula_vector,
+            c_nmr_mask=c_nmr_mask,
+            h_nmr_mask=h_nmr_mask,
         )
-        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
 
-        # 验证mask形状是否匹配
         batch_size, seq_len, _ = encoder_hidden.shape
         assert attention_mask.shape == (batch_size, seq_len), \
             f"Mask shape {attention_mask.shape} doesn't match sequence length {seq_len}"
 
-        # 送入 T5 decoder
+        if self.decoder_type == "graph":
+            return self.graph_decoder(encoder_hidden, attention_mask)
+
+        encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
         outputs = self.t5(
             encoder_outputs=encoder_outputs,
-            attention_mask=attention_mask,  # 这里使用1表示有效，0表示padding
+            attention_mask=attention_mask,
             labels=smiles_ids,
         )
         return outputs
     
     def training_step(self, batch, batch_idx):
         """Training step for autoregressive generation."""
-        smiles_ids = batch["smiles"].long()
-        
-        # 根据配置获取输入（消融实验）
         c_peaks = batch.get("c_nmr_peaks") if self.c_encoder is not None else None
         c_nmr_mask = batch.get("c_nmr_mask") if self.c_encoder is not None else None
-        
-        # 获取预处理的1HNMR特征
         h_features = batch.get("h_nmr_features") if self.h_encoder is not None else None
         h_nmr_mask = batch.get("h_nmr_mask") if self.h_encoder is not None else None
-        
-        # Check for NaN in input data
+        formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
+
         if c_peaks is not None and torch.isnan(c_peaks).any():
             logger.warning(f"NaN detected in c_peaks at batch {batch_idx}")
         if h_features is not None and torch.isnan(h_features).any():
             logger.warning(f"NaN detected in h_features at batch {batch_idx}")
 
-        # if self.training:
-        #     # C-NMR: 归一化空间加噪声 (约 1-2 ppm 等效)
-        #     if c_peaks is not None and c_nmr_mask is not None:
-        #         noise = torch.randn_like(c_peaks) * 0.005  # ✅ 归一化尺度
-        #         c_peaks = c_peaks + noise
-        #         c_peaks = torch.clamp(c_peaks, 0.0, 1.0)  # 保持范围
-            
-        #     # H-NMR: 化学位移加噪声 (约 0.1 ppm 等效)
-        #     if h_features is not None and h_nmr_mask is not None:
-        #         h_shift_noise = torch.randn_like(h_features[:, :, 0:1]) * 0.08  # ✅ 归一化尺度
-        #         h_features = h_features.clone()  # 避免 inplace 操作
-        #         h_features[:, :, 0:1] = h_features[:, :, 0:1] + h_shift_noise
-        #         h_features[:, :, 0:1] = torch.clamp(h_features[:, :, 0:1], 0.0, 1.0)
-                
-        # T5 expects labels with -100 for positions to ignore
-        labels = smiles_ids.clone()
-        labels[labels == self.config.PAD_TOKEN_ID] = -100
-        
-        formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
-        
-        # Forward pass
-        outputs = self(
-            c_peaks=c_peaks,
-            h_peaks=None,  # Not used directly anymore
-            formula_vector=formula_vector,
-            smiles_ids=labels,
-            c_nmr_mask=c_nmr_mask,
-            h_nmr_mask=h_nmr_mask,
-            h_features=h_features,  # Pass preprocessed features
-        )
-        
-        loss = outputs.loss
-        
-        # Check for NaN loss
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.error(f"NaN/Inf loss detected at batch {batch_idx}")
-            logger.error(f"C peaks shape: {c_peaks.shape if c_peaks is not None else None}")
-            logger.error(f"H features shape: {h_features.shape if h_features is not None else None}")
-            logger.error(f"SMILES ids shape: {smiles_ids.shape}")
-            logger.error(f"Labels shape: {labels.shape}")
-            # Check data range
-            if c_peaks is not None:
-                logger.error(f"C peaks range: [{c_peaks.min():.4f}, {c_peaks.max():.4f}]")
-            if h_features is not None:
-                logger.error(f"H features range: [{h_features.min():.4f}, {h_features.max():.4f}]")
-            # Check if logits have NaN
-            if torch.isnan(outputs.logits).any():
-                logger.error("NaN detected in model logits!")
-            # Skip this batch
-            return None
-        
-        # Compute accuracy
-        with torch.no_grad():
-            logits = outputs.logits
-            pred_tokens = logits.argmax(dim=-1)
-            # Only consider non-padding positions
-            valid_mask = (smiles_ids != self.config.PAD_TOKEN_ID)
-            correct = (pred_tokens == smiles_ids) & valid_mask
-            token_acc = correct.sum().float() / valid_mask.sum().float()
-            
-            # Sequence accuracy: all tokens correct
-            seq_correct = ((pred_tokens == smiles_ids) | ~valid_mask).all(dim=1)
-            seq_acc = seq_correct.float().mean()
-        
-        # Log metrics (添加 logger=True 以同步到 SwanLab)
-        self.log("train_loss", loss, prog_bar=True, sync_dist=True, logger=True)
-        self.log("train_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
-        self.log("train_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
+        if self.decoder_type == "graph":
+            graph_outputs = self(
+                c_peaks=c_peaks,
+                formula_vector=formula_vector,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
+                h_features=h_features,
+            )
+            loss_dict = self._compute_graph_loss(graph_outputs, batch)
+            metrics = self._compute_graph_metrics(graph_outputs, batch)
+            loss = loss_dict["loss"]
+
+            self.log("train_loss", loss, prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_node_presence_acc", metrics["node_presence_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_node_symbol_acc", metrics["node_symbol_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_edge_acc", metrics["edge_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_graph_exact", metrics["graph_exact"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_edge_loss", loss_dict["edge_loss"], prog_bar=False, sync_dist=True, logger=True)
+        else:
+            smiles_ids = batch["smiles"].long()
+            labels = smiles_ids.clone()
+            labels[labels == self.config.PAD_TOKEN_ID] = -100
+
+            outputs = self(
+                c_peaks=c_peaks,
+                h_peaks=None,
+                formula_vector=formula_vector,
+                smiles_ids=labels,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
+                h_features=h_features,
+            )
+
+            loss = outputs.loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.error(f"NaN/Inf loss detected at batch {batch_idx}")
+                return None
+
+            with torch.no_grad():
+                logits = outputs.logits
+                pred_tokens = logits.argmax(dim=-1)
+                valid_mask = (smiles_ids != self.config.PAD_TOKEN_ID)
+                correct = (pred_tokens == smiles_ids) & valid_mask
+                token_acc = correct.sum().float() / valid_mask.sum().float()
+                seq_correct = ((pred_tokens == smiles_ids) | ~valid_mask).all(dim=1)
+                seq_acc = seq_correct.float().mean()
+
+            self.log("train_loss", loss, prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_token_acc", token_acc, prog_bar=True, sync_dist=True, logger=True)
+            self.log("train_seq_acc", seq_acc, prog_bar=True, sync_dist=True, logger=True)
         
         # Log learning rate
         if self.trainer and self.trainer.optimizers:
@@ -931,6 +1141,30 @@ class NMR2SMILESModel(pl.LightningModule):
         h_features = batch.get("h_nmr_features") if self.h_encoder is not None else None
         h_nmr_mask = batch.get("h_nmr_mask") if self.h_encoder is not None else None
         formula_vector = batch.get("formula_vector") if self.formula_encoder is not None else None
+
+        if self.decoder_type == "graph":
+            graph_outputs = self(
+                c_peaks=c_peaks,
+                h_features=h_features,
+                formula_vector=formula_vector,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
+            )
+            loss_dict = self._compute_graph_loss(graph_outputs, batch)
+            metrics = self._compute_graph_metrics(graph_outputs, batch)
+
+            self.log("val_loss", loss_dict["loss"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("val_node_presence_acc", metrics["node_presence_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("val_node_symbol_acc", metrics["node_symbol_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("val_edge_acc", metrics["edge_acc"], prog_bar=True, sync_dist=True, logger=True)
+            self.log("val_graph_exact", metrics["graph_exact"], prog_bar=True, sync_dist=True, logger=True)
+            return {
+                "val_loss": loss_dict["loss"],
+                "val_node_presence_acc": metrics["node_presence_acc"],
+                "val_node_symbol_acc": metrics["node_symbol_acc"],
+                "val_edge_acc": metrics["edge_acc"],
+                "val_graph_exact": metrics["graph_exact"],
+            }
         
         # ========== Teacher Forcing 评估（Token 级别）==========
         labels = smiles_ids.clone()
@@ -1059,6 +1293,9 @@ class NMR2SMILESModel(pl.LightningModule):
         在验证 epoch 结束时聚合所有 batch 的指标。
         ✅ 确保 Lightning 记录的指标与实际测试结果一致
         """
+        if self.decoder_type == "graph":
+            self.validation_outputs = []
+            return
         if not self.validation_outputs:
             return
         
@@ -1111,6 +1348,38 @@ class NMR2SMILESModel(pl.LightningModule):
         Generate SMILES using T5 generation with optional formula guidance.
         Updated to support h_features for 1HNMR.
         """
+        if self.decoder_type == "graph":
+            device = next(self.parameters()).device
+            if c_peaks is not None:
+                c_peaks = c_peaks.to(device).float()
+            if c_nmr_mask is not None:
+                c_nmr_mask = c_nmr_mask.to(device).long()
+            if h_features is not None:
+                h_features = h_features.to(device).float()
+            if h_nmr_mask is not None:
+                h_nmr_mask = h_nmr_mask.to(device).long()
+            if formula_vector is not None:
+                formula_vector = formula_vector.to(device).float()
+
+            encoder_hidden, attention_mask = self._encode_modalities(
+                c_peaks=c_peaks,
+                h_features=h_features,
+                formula_vector=formula_vector,
+                c_nmr_mask=c_nmr_mask,
+                h_nmr_mask=h_nmr_mask,
+            )
+            graph_outputs = self.graph_decoder(encoder_hidden, attention_mask)
+            return {
+                "node_mask": (graph_outputs["node_presence_logits"] > 0).long(),
+                "node_symbol": graph_outputs["node_symbol_logits"].argmax(dim=-1),
+                "node_charge": graph_outputs["node_charge_logits"].argmax(dim=-1),
+                "node_aromatic": graph_outputs["node_aromatic_logits"].argmax(dim=-1),
+                "node_hybrid": graph_outputs["node_hybrid_logits"].argmax(dim=-1),
+                "node_chiral": graph_outputs["node_chiral_logits"].argmax(dim=-1),
+                "node_hydrogen": graph_outputs["node_hydrogen_logits"].argmax(dim=-1),
+                "edge_labels": graph_outputs["edge_logits"].argmax(dim=-1),
+            }
+
         if max_length is None:
             max_length = self.config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS
         
@@ -1167,41 +1436,13 @@ class NMR2SMILESModel(pl.LightningModule):
             h_nmr_mask = h_nmr_mask.to(device).long()
         if formula_vector is not None:
             formula_vector = formula_vector.to(device).float()
-        
-        # 编码NMR数据（根据配置）
-        z_c = None
-        g_c = None
-        if self.c_encoder is not None and c_peaks is not None:
-            z_c, g_c, c_nmr_mask = self.c_encoder(c_peaks, mask=c_nmr_mask)
-        
-        z_h = None
-        g_h = None
-        if self.h_encoder is not None and h_features is not None:  # Use h_features
-            z_h, g_h, h_nmr_mask = self.h_encoder(h_features, mask=h_nmr_mask)
-        
-        # 编码公式指导
-        z_guidance = None
-        if self.formula_encoder is not None and formula_vector is not None:
-            # 确保formula_vector有正确的形状
-            if formula_vector.dim() == 1:
-                formula_vector = formula_vector.unsqueeze(0)
-            # 验证向量维度
-            expected_dim = self.config.FORMULA_VECTOR_SIZE
-            actual_dim = formula_vector.shape[1]
-            if actual_dim != expected_dim:
-                pass # Warning already logged in validation?
-            # For generation, we fix it silently or reuse logic
-            if actual_dim < expected_dim:
-                padding = torch.zeros(formula_vector.shape[0], expected_dim - actual_dim, device=device)
-                formula_vector = torch.cat([formula_vector, padding], dim=1)
-            else:
-                formula_vector = formula_vector[:, :expected_dim]
-            z_guidance = self.formula_encoder(formula_vector)
-        
-        # g_c = None
-        # g_h = None
-        # 融合所有模态
-        encoder_hidden, attention_mask = self.fusion(z_c, z_h, g_c, g_h, z_guidance, c_nmr_mask, h_nmr_mask)
+        encoder_hidden, attention_mask = self._encode_modalities(
+            c_peaks=c_peaks,
+            h_features=h_features,
+            formula_vector=formula_vector,
+            c_nmr_mask=c_nmr_mask,
+            h_nmr_mask=h_nmr_mask,
+        )
         
         # 创建encoder输出
         encoder_outputs = BaseModelOutput(last_hidden_state=encoder_hidden)
@@ -1330,6 +1571,8 @@ class NMR2SMILESModel(pl.LightningModule):
 
     def _resize_t5_embeddings_to_tokenizer(self):
         """Resize T5 embeddings and LM head to match the custom SMILES tokenizer."""
+        if self.t5 is None:
+            return
         vocab_size = len(self.tokenizer)
         current_size = self.t5.config.vocab_size
 

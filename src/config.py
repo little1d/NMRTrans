@@ -188,6 +188,27 @@ class TrainingConfig:
     DEVICES = _get_config("DEVICES", 8)  # Number of GPUs
     PRECISION = _get_config("PRECISION", "32")  # "16-mixed", "bf16-mixed", "32"
     
+    # ========== Decoder / Representation Configuration ==========
+    # Decoder type: "smiles" (default) or "graph"
+    DECODER_TYPE = _get_config("DECODER_TYPE", "smiles")
+    # Enable using graph inputs (nodes/edges) from dataset when available
+    USE_GRAPH = _get_config("USE_GRAPH", False)
+    # Graph settings (only used when USE_GRAPH or DECODER_TYPE == "graph")
+    GRAPH_MAX_NODES = _get_config("GRAPH_MAX_NODES", 128)
+    GRAPH_MAX_EDGES = _get_config("GRAPH_MAX_EDGES", 256)
+    # Edge types we support mapping for
+    GRAPH_EDGE_TYPES = _get_config("GRAPH_EDGE_TYPES", ["S", "D", "T", "A", "UNK"])
+    # Atom vocab for symbols (reused from ALL_ATOMS when possible, can be extended later)
+    GRAPH_ATOM_VOCAB = _get_config("GRAPH_ATOM_VOCAB", ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si'])
+    GRAPH_CHARGE_VALUES = _get_config("GRAPH_CHARGE_VALUES", [-2, -1, 0, 1, 2])
+    GRAPH_HYBRIDIZATION_VALUES = _get_config("GRAPH_HYBRIDIZATION_VALUES", [0, 1, 2, 3, 4, 5, 6, 7])
+    GRAPH_CHIRAL_TAG_VALUES = _get_config("GRAPH_CHIRAL_TAG_VALUES", [0, 1, 2, 3])
+    GRAPH_HYDROGEN_COUNT_VALUES = _get_config("GRAPH_HYDROGEN_COUNT_VALUES", [0, 1, 2, 3, 4])
+    GRAPH_DECODER_N_LAYERS = _get_config("GRAPH_DECODER_N_LAYERS", 4)
+    GRAPH_DECODER_N_HEADS = _get_config("GRAPH_DECODER_N_HEADS", 8)
+    GRAPH_DECODER_FF_DIM = _get_config("GRAPH_DECODER_FF_DIM", 2048)
+    GRAPH_DECODER_DROPOUT = _get_config("GRAPH_DECODER_DROPOUT", 0.1)
+
     # ========== Special Token IDs ==========
     # These will be set by prepare_tokenizer()
     PAD_TOKEN_ID = None

@@ -9,7 +9,7 @@ import time
 import warnings
 import json
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 from collections import defaultdict
 
 import numpy as np
@@ -28,7 +28,7 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from config import TrainingConfig, prepare_tokenizer
-from data import MergedDataset
+from data import MergedDataset, build_graph_decoder_targets
 from model import NMR2SMILESModel
 
 # Environment setup
@@ -149,6 +149,113 @@ def calculate_smiles_similarity(smiles1: str, smiles2: str) -> float:
     except Exception:
         # Catch any other exceptions
         return -1.0
+
+def _build_graph_label_maps(config: TrainingConfig):
+    edge_types = list(getattr(config, "GRAPH_EDGE_TYPES", ["S", "D", "T", "A", "UNK"]))
+    charge_values = list(getattr(config, "GRAPH_CHARGE_VALUES", [-2, -1, 0, 1, 2]))
+    hybrid_values = list(getattr(config, "GRAPH_HYBRIDIZATION_VALUES", [0, 1, 2, 3, 4, 5, 6, 7]))
+    chiral_values = list(getattr(config, "GRAPH_CHIRAL_TAG_VALUES", [0, 1, 2, 3]))
+    hydrogen_values = list(getattr(config, "GRAPH_HYDROGEN_COUNT_VALUES", [0, 1, 2, 3, 4]))
+    atom_vocab = list(getattr(config, "GRAPH_ATOM_VOCAB", ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si']))
+    return {
+        "edge_types": edge_types,
+        "charge_values": charge_values,
+        "hybrid_values": hybrid_values,
+        "chiral_values": chiral_values,
+        "hydrogen_values": hydrogen_values,
+        "atom_vocab": atom_vocab,
+    }
+
+def _hybridization_from_int(value: int):
+    for attr in dir(Chem.rdchem.HybridizationType):
+        enum_val = getattr(Chem.rdchem.HybridizationType, attr)
+        if isinstance(enum_val, Chem.rdchem.HybridizationType) and int(enum_val) == int(value):
+            return enum_val
+    return Chem.rdchem.HybridizationType.UNSPECIFIED
+
+def _chiral_from_int(value: int):
+    for attr in dir(Chem.rdchem.ChiralType):
+        enum_val = getattr(Chem.rdchem.ChiralType, attr)
+        if isinstance(enum_val, Chem.rdchem.ChiralType) and int(enum_val) == int(value):
+            return enum_val
+    return Chem.rdchem.ChiralType.CHI_UNSPECIFIED
+
+def _bond_type_from_label(label: str):
+    if label == "S":
+        return Chem.rdchem.BondType.SINGLE
+    if label == "D":
+        return Chem.rdchem.BondType.DOUBLE
+    if label == "T":
+        return Chem.rdchem.BondType.TRIPLE
+    if label == "A":
+        return Chem.rdchem.BondType.AROMATIC
+    return None
+
+def graph_prediction_to_mol(
+    node_mask: torch.Tensor,
+    node_symbol: torch.Tensor,
+    node_charge: torch.Tensor,
+    node_aromatic: torch.Tensor,
+    node_hybrid: torch.Tensor,
+    node_chiral: torch.Tensor,
+    node_hydrogen: torch.Tensor,
+    edge_labels: torch.Tensor,
+    config: TrainingConfig,
+) -> Optional["Chem.Mol"]:
+    if not RDKit_AVAILABLE:
+        return None
+
+    maps = _build_graph_label_maps(config)
+    active_nodes = [idx for idx, value in enumerate(node_mask.tolist()) if int(value) == 1]
+    if not active_nodes:
+        return None
+
+    mol = Chem.RWMol()
+    old_to_new = {}
+    for old_idx in active_nodes:
+        atom_symbol = maps["atom_vocab"][int(node_symbol[old_idx])]
+        atom = Chem.Atom(atom_symbol)
+        atom.SetFormalCharge(int(maps["charge_values"][int(node_charge[old_idx])]))
+        atom.SetIsAromatic(bool(int(node_aromatic[old_idx])))
+        atom.SetHybridization(_hybridization_from_int(int(maps["hybrid_values"][int(node_hybrid[old_idx])])))
+        atom.SetChiralTag(_chiral_from_int(int(maps["chiral_values"][int(node_chiral[old_idx])])))
+        atom.SetNumExplicitHs(int(maps["hydrogen_values"][int(node_hydrogen[old_idx])]))
+        atom.SetNoImplicit(False)
+        old_to_new[old_idx] = mol.AddAtom(atom)
+
+    edge_array = edge_labels.tolist()
+    for src in active_nodes:
+        for dst in active_nodes:
+            if dst <= src:
+                continue
+            edge_id = int(edge_array[src][dst])
+            if edge_id <= 0:
+                continue
+            bond_label = maps["edge_types"][edge_id - 1]
+            bond_type = _bond_type_from_label(bond_label)
+            if bond_type is None:
+                continue
+            mol.AddBond(old_to_new[src], old_to_new[dst], bond_type)
+            if bond_label == "A":
+                bond = mol.GetBondBetweenAtoms(old_to_new[src], old_to_new[dst])
+                if bond is not None:
+                    bond.SetIsAromatic(True)
+
+    try:
+        pred_mol = mol.GetMol()
+        Chem.SanitizeMol(pred_mol)
+        return pred_mol
+    except Exception:
+        return None
+
+def graph_prediction_to_smiles(*args, **kwargs) -> str:
+    mol = graph_prediction_to_mol(*args, **kwargs)
+    if mol is None:
+        return ""
+    try:
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return ""
 
 def pad_peak_sequences(peak_sequences, max_peaks):
     """Pad peak sequences to the same length and return mask (1=valid, 0=pad)."""
@@ -358,6 +465,9 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_featur
         formula_tensor = torch.stack(formula_vectors)
         spectra_data["formula_vector"] = formula_tensor
     
+    if getattr(config, "DECODER_TYPE", "smiles") == "graph":
+        spectra_data.update(build_graph_decoder_targets(batch, config))
+    
     return {
         "smiles": smiles_tensor,
         "original_smiles": original_smiles_list,
@@ -552,6 +662,113 @@ def load_model(config: TrainingConfig, tokenizer, checkpoint_path: str):
     
     logger.info(f"Model loaded to {device}")
     return model
+
+def evaluate_graph_generation(model, test_loader, config, enabled_features=None):
+    """Evaluate graph decoder with node/edge reconstruction metrics."""
+    logger.info("\n===== Starting Graph Decoder Evaluation =====")
+
+    model_module = get_model_module(model)
+    device = next(model_module.parameters()).device
+    start_time = time.time()
+
+    aggregated = {
+        "loss": [],
+        "node_presence_acc": [],
+        "node_symbol_acc": [],
+        "edge_acc": [],
+        "graph_exact": [],
+        "validity": [],
+        "molecule_exact": [],
+        "similarity": [],
+        "examples": [],
+    }
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Evaluating graph", total=len(test_loader), unit="batch", ncols=100):
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+            outputs = model_module(
+                c_peaks=batch.get("c_nmr_peaks") if 'c_nmr' in enabled_features else None,
+                h_features=batch.get("h_nmr_features") if 'h_nmr' in enabled_features else None,
+                formula_vector=batch.get("formula_vector") if 'formula' in enabled_features else None,
+                c_nmr_mask=batch.get("c_nmr_mask") if 'c_nmr' in enabled_features else None,
+                h_nmr_mask=batch.get("h_nmr_mask") if 'h_nmr' in enabled_features else None,
+            )
+            loss_dict = model_module._compute_graph_loss(outputs, batch)
+            metrics = model_module._compute_graph_metrics(outputs, batch)
+            graph_predictions = model_module.generate(
+                c_peaks=batch.get("c_nmr_peaks") if 'c_nmr' in enabled_features else None,
+                h_features=batch.get("h_nmr_features") if 'h_nmr' in enabled_features else None,
+                formula_vector=batch.get("formula_vector") if 'formula' in enabled_features else None,
+                c_nmr_mask=batch.get("c_nmr_mask") if 'c_nmr' in enabled_features else None,
+                h_nmr_mask=batch.get("h_nmr_mask") if 'h_nmr' in enabled_features else None,
+            )
+
+            aggregated["loss"].append(loss_dict["loss"].item())
+            aggregated["node_presence_acc"].append(metrics["node_presence_acc"].item())
+            aggregated["node_symbol_acc"].append(metrics["node_symbol_acc"].item())
+            aggregated["edge_acc"].append(metrics["edge_acc"].item())
+            aggregated["graph_exact"].append(metrics["graph_exact"].item())
+            
+            batch_size = batch["graph_node_mask"].size(0)
+            for i in range(batch_size):
+                pred_smiles = graph_prediction_to_smiles(
+                    graph_predictions["node_mask"][i].detach().cpu(),
+                    graph_predictions["node_symbol"][i].detach().cpu(),
+                    graph_predictions["node_charge"][i].detach().cpu(),
+                    graph_predictions["node_aromatic"][i].detach().cpu(),
+                    graph_predictions["node_hybrid"][i].detach().cpu(),
+                    graph_predictions["node_chiral"][i].detach().cpu(),
+                    graph_predictions["node_hydrogen"][i].detach().cpu(),
+                    graph_predictions["edge_labels"][i].detach().cpu(),
+                    config,
+                )
+                true_smiles = batch["original_smiles"][i]
+                is_valid = 1 if pred_smiles else 0
+                aggregated["validity"].append(is_valid)
+
+                if pred_smiles:
+                    try:
+                        exact = 1 if Chem.MolToSmiles(Chem.MolFromSmiles(pred_smiles)) == Chem.MolToSmiles(Chem.MolFromSmiles(true_smiles)) else 0
+                    except Exception:
+                        exact = 0
+                    similarity = calculate_smiles_similarity(pred_smiles, true_smiles)
+                else:
+                    exact = 0
+                    similarity = -1.0
+
+                aggregated["molecule_exact"].append(exact)
+                if similarity >= 0:
+                    aggregated["similarity"].append(similarity)
+
+                if len(aggregated["examples"]) < 20:
+                    aggregated["examples"].append({
+                        "target_nodes": int(batch["graph_node_mask"][i].sum().item()),
+                        "pred_nodes": int(graph_predictions["node_mask"][i].sum().item()),
+                        "pred_smiles": pred_smiles,
+                        "true_smiles": true_smiles,
+                        "valid": bool(is_valid),
+                        "molecule_exact": exact,
+                        "similarity": similarity if similarity >= 0 else None,
+                    })
+
+    return {
+        "metrics": {
+            "graph_loss": float(np.mean(aggregated["loss"])),
+            "node_presence_accuracy": float(np.mean(aggregated["node_presence_acc"])),
+            "node_symbol_accuracy": float(np.mean(aggregated["node_symbol_acc"])),
+            "edge_accuracy": float(np.mean(aggregated["edge_acc"])),
+            "graph_exact_accuracy": float(np.mean(aggregated["graph_exact"])),
+            "valid_smiles_ratio": float(np.mean(aggregated["validity"])) if aggregated["validity"] else 0.0,
+            "molecule_exact_accuracy": float(np.mean(aggregated["molecule_exact"])) if aggregated["molecule_exact"] else 0.0,
+            "tanimoto_similarity": float(np.mean(aggregated["similarity"])) if aggregated["similarity"] else None,
+            "similarity_samples": len(aggregated["similarity"]),
+            "total_samples": len(test_loader.dataset),
+            "examples": aggregated["examples"],
+        },
+        "grouped_metrics": {},
+        "inference_time": time.time() - start_time,
+    }
 
 def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, enabled_features=None):
     """
@@ -913,7 +1130,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
 def print_results(results, enabled_features=None):
     """Print evaluation results"""
     logger.info("\n" + "="*80)
-    logger.info("===== Evaluation Results (Greedy Decoding) =====")
+    logger.info("===== Evaluation Results =====")
     logger.info("="*80)
     
     if enabled_features:
@@ -922,31 +1139,43 @@ def print_results(results, enabled_features=None):
     # Print overall results
     metrics = results["metrics"]
     logger.info(f"\n--- Overall Results ---")
-    logger.info(f"  Token Accuracy: {metrics['token_accuracy']:.4f}")
-    logger.info(f"  Sequence Accuracy: {metrics['sequence_accuracy']:.4f}")
-    logger.info(f"  Valid SMILES Ratio: {metrics['valid_smiles_ratio']:.4f}")
-    if metrics.get('tanimoto_similarity') is not None:
-        logger.info(f"  Tanimoto Similarity: {metrics['tanimoto_similarity']:.4f} (n={metrics['similarity_samples']})")
-    if metrics.get("teacher_forcing_token_accuracy") is not None:
-        logger.info(f"  TF Token Accuracy (teacher forcing): {metrics['teacher_forcing_token_accuracy']:.4f}")
-    if metrics.get("teacher_forcing_sequence_accuracy") is not None:
-        logger.info(f"  TF Sequence Accuracy (teacher forcing): {metrics['teacher_forcing_sequence_accuracy']:.4f}")
-    if metrics.get("topk_sequence_accuracy"):
-        topk_str = ", ".join([f"top{k}: {metrics['topk_sequence_accuracy'][k]:.4f}" for k in sorted(metrics["topk_sequence_accuracy"].keys())])
-        logger.info(f"  Beam Search Seq Acc ({topk_str})")
+    if "token_accuracy" in metrics:
+        logger.info(f"  Token Accuracy: {metrics['token_accuracy']:.4f}")
+        logger.info(f"  Sequence Accuracy: {metrics['sequence_accuracy']:.4f}")
+        logger.info(f"  Valid SMILES Ratio: {metrics['valid_smiles_ratio']:.4f}")
+        if metrics.get('tanimoto_similarity') is not None:
+            logger.info(f"  Tanimoto Similarity: {metrics['tanimoto_similarity']:.4f} (n={metrics['similarity_samples']})")
+        if metrics.get("teacher_forcing_token_accuracy") is not None:
+            logger.info(f"  TF Token Accuracy (teacher forcing): {metrics['teacher_forcing_token_accuracy']:.4f}")
+        if metrics.get("teacher_forcing_sequence_accuracy") is not None:
+            logger.info(f"  TF Sequence Accuracy (teacher forcing): {metrics['teacher_forcing_sequence_accuracy']:.4f}")
+        if metrics.get("topk_sequence_accuracy"):
+            topk_str = ", ".join([f"top{k}: {metrics['topk_sequence_accuracy'][k]:.4f}" for k in sorted(metrics["topk_sequence_accuracy"].keys())])
+            logger.info(f"  Beam Search Seq Acc ({topk_str})")
+    else:
+        logger.info(f"  Graph Loss: {metrics['graph_loss']:.4f}")
+        logger.info(f"  Node Presence Accuracy: {metrics['node_presence_accuracy']:.4f}")
+        logger.info(f"  Node Symbol Accuracy: {metrics['node_symbol_accuracy']:.4f}")
+        logger.info(f"  Edge Accuracy: {metrics['edge_accuracy']:.4f}")
+        logger.info(f"  Graph Exact Accuracy: {metrics['graph_exact_accuracy']:.4f}")
+        logger.info(f"  Valid Molecule Ratio: {metrics['valid_smiles_ratio']:.4f}")
+        logger.info(f"  Molecule Exact Accuracy: {metrics['molecule_exact_accuracy']:.4f}")
+        if metrics.get('tanimoto_similarity') is not None:
+            logger.info(f"  Tanimoto Similarity: {metrics['tanimoto_similarity']:.4f} (n={metrics['similarity_samples']})")
     logger.info(f"  Total Samples: {metrics['total_samples']}")
     
     # Print grouped metrics
-    logger.info("\n--- Grouped Metrics by SMILES Length ---")
-    for group_name, group_metrics in results["grouped_metrics"].items():
-        if group_name == "all":
-            continue
-        logger.info(f"\n  {group_name} (n={group_metrics['sample_count']}):")
-        logger.info(f"    Token Acc: {group_metrics['token_acc']:.4f}")
-        logger.info(f"    Seq Acc: {group_metrics['seq_acc']:.4f}")
-        logger.info(f"    Valid Ratio: {group_metrics['valid_ratio']:.4f}")
-        if 'similarity' in group_metrics:
-            logger.info(f"    Tanimoto Similarity: {group_metrics['similarity']:.4f}")
+    if results["grouped_metrics"]:
+        logger.info("\n--- Grouped Metrics by SMILES Length ---")
+        for group_name, group_metrics in results["grouped_metrics"].items():
+            if group_name == "all":
+                continue
+            logger.info(f"\n  {group_name} (n={group_metrics['sample_count']}):")
+            logger.info(f"    Token Acc: {group_metrics['token_acc']:.4f}")
+            logger.info(f"    Seq Acc: {group_metrics['seq_acc']:.4f}")
+            logger.info(f"    Valid Ratio: {group_metrics['valid_ratio']:.4f}")
+            if 'similarity' in group_metrics:
+                logger.info(f"    Tanimoto Similarity: {group_metrics['similarity']:.4f}")
     
     logger.info(f"\nInference Time: {results['inference_time']:.2f} seconds")
     logger.info("="*80)
@@ -1122,13 +1351,21 @@ Examples:
     )
     
     # Evaluate
-    results = evaluate_autoregressive_generation(
-        model, 
-        test_loader, 
-        config, 
-        tokenizer,
-        enabled_features=final_enabled_features
-    )
+    if getattr(config, "DECODER_TYPE", "smiles") == "graph":
+        results = evaluate_graph_generation(
+            model,
+            test_loader,
+            config,
+            enabled_features=final_enabled_features,
+        )
+    else:
+        results = evaluate_autoregressive_generation(
+            model,
+            test_loader,
+            config,
+            tokenizer,
+            enabled_features=final_enabled_features
+        )
     
     # Print results
     print_results(results, enabled_features=final_enabled_features)
@@ -1138,18 +1375,34 @@ Examples:
     
     # Save metrics (convert tensors to Python types)
     metrics = results["metrics"]
-    results_to_save = {
-        "test_file": test_file_path,  # Test dataset path
-        "checkpoint_path": checkpoint_path,  # Model checkpoint path
-        "enabled_features": list(final_enabled_features),  # Features used for evaluation
-        "metrics": {
+    if "token_accuracy" in metrics:
+        saved_metrics = {
             "token_accuracy": float(metrics["token_accuracy"]),
             "sequence_accuracy": float(metrics["sequence_accuracy"]),
             "valid_smiles_ratio": float(metrics["valid_smiles_ratio"]),
             "tanimoto_similarity": float(metrics["tanimoto_similarity"]) if metrics.get("tanimoto_similarity") is not None else None,
             "similarity_samples": int(metrics.get("similarity_samples", 0)),
             "total_samples": int(metrics["total_samples"]),
-        },
+        }
+    else:
+        saved_metrics = {
+            "graph_loss": float(metrics["graph_loss"]),
+            "node_presence_accuracy": float(metrics["node_presence_accuracy"]),
+            "node_symbol_accuracy": float(metrics["node_symbol_accuracy"]),
+            "edge_accuracy": float(metrics["edge_accuracy"]),
+            "graph_exact_accuracy": float(metrics["graph_exact_accuracy"]),
+            "valid_smiles_ratio": float(metrics["valid_smiles_ratio"]),
+            "molecule_exact_accuracy": float(metrics["molecule_exact_accuracy"]),
+            "tanimoto_similarity": float(metrics["tanimoto_similarity"]) if metrics.get("tanimoto_similarity") is not None else None,
+            "similarity_samples": int(metrics.get("similarity_samples", 0)),
+            "total_samples": int(metrics["total_samples"]),
+        }
+
+    results_to_save = {
+        "test_file": test_file_path,
+        "checkpoint_path": checkpoint_path,
+        "enabled_features": list(final_enabled_features),
+        "metrics": saved_metrics,
         "grouped_metrics": results["grouped_metrics"],
         "inference_time": float(results["inference_time"])
     }

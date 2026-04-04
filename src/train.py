@@ -41,7 +41,7 @@ if parent_path not in sys.path:
 
 from config import TrainingConfig, prepare_tokenizer
 from callbacks import get_default_callbacks
-from data import MergedDataset
+from data import MergedDataset, build_graph_decoder_targets
 from model import NMR2SMILESModel
 
 
@@ -324,7 +324,10 @@ def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, apply_jitter=F
         formula_tensor = torch.stack(formula_vectors)
         spectra_data["formula_vector"] = formula_tensor
         spectra_data["formula_strings"] = formula_strings
-
+    
+    if getattr(config, "DECODER_TYPE", "smiles") == "graph":
+        spectra_data.update(build_graph_decoder_targets(batch, config))
+    
     return {
         "smiles": smiles_tensor,
         "original_smiles": original_smiles_list,
