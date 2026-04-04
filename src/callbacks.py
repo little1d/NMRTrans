@@ -230,16 +230,24 @@ class SwanLabImageLogger(Callback):
 
 def get_default_callbacks(config, save_dir: str):
     """Get default callbacks for training."""
+    decoder_type = getattr(config, "DECODER_TYPE", "smiles")
+    if decoder_type == "graph":
+        checkpoint_monitor = "val_graph_exact"
+        checkpoint_filename = "graph-{epoch:02d}-graphacc={val_graph_exact:.4f}"
+    else:
+        checkpoint_monitor = "val_seq_acc"
+        checkpoint_filename = "ar-{epoch:02d}-valacc={val_seq_acc:.4f}"
+
     callbacks = [
         EpochResultPrinter(),
         ValidationResultPrinter(),
         GradientMonitor(log_every_n_steps=50),
         BestModelCheckpoint(
             dirpath=save_dir,
-            monitor="val_seq_acc",
+            monitor=checkpoint_monitor,
             mode="max",
             save_top_k=3,
-            filename="ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
+            filename=checkpoint_filename,
         ),
     ]
     
