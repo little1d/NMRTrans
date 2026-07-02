@@ -1,54 +1,27 @@
 import logging
 import os
+import importlib.util
+from copy import deepcopy
+from pathlib import Path
 
 
-def _load_local_config():
-    """Load local configuration from config_local.py if it exists."""
-    try:
-        # Try relative import first
-        from . import config_local
-        return config_local
-    except (ImportError, ValueError):
-        # If relative import fails, try absolute import
-        try:
-            import config_local
-            return config_local
-        except ImportError:
-            # If that also fails, try importing from current directory
-            try:
-                import sys
-                import os
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                if current_dir not in sys.path:
-                    sys.path.insert(0, current_dir)
-                import config_local
-                return config_local
-            except ImportError:
-                return None
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_CONFIG_PATH = Path(__file__).with_name("config_local.py")
+_USE_MODULE_LOCAL_CONFIG = object()
 
 
-# Load local config if available
-_local_config = _load_local_config()
+def _load_local_config(path: Path = LOCAL_CONFIG_PATH):
+    """Load optional src/config_local.py without mutating sys.path."""
+    if not path.exists():
+        return None
 
-# Debug: check if local config is loaded
-if _local_config:
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info("Successfully loaded config_local.py")
-    if hasattr(_local_config, 'T5_MODEL_NAME'):
-        logger.info(f"T5_MODEL_NAME from config_local: {_local_config.T5_MODEL_NAME}")
-else:
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.warning("config_local.py not found, using default configuration")
+    spec = importlib.util.spec_from_file_location("nmrtrans_config_local", path)
+    if spec is None or spec.loader is None:
+        return None
 
-
-# Helper function to get config value from local config or default
-def _get_config(key: str, default):
-    """Get configuration value from local config if available, otherwise use default."""
-    if _local_config and hasattr(_local_config, key):
-        return getattr(_local_config, key)
-    return default
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _infer_t5_d_model(model_name: str, fallback: int = 512) -> int:
@@ -64,148 +37,245 @@ def _infer_t5_d_model(model_name: str, fallback: int = 512) -> int:
             return value
     return fallback
 
-def _infer_bart_d_model(model_name: str, fallback: int = 768) -> int:
-    """Infer BART d_model size from model name or path."""
-    name = os.path.basename(str(model_name)).lower()
-    bart_d_model_map = {
-        "bart-base": 768,
-        "bart-large": 1024,
+_DEFAULT_ALL_ATOMS = ["B", "Br", "C", "Cl", "F", "H", "I", "N", "O", "P", "S", "Si"]
+_DEFAULT_MAX_SMILES_LENGTH = 80
+_DEFAULT_T5_MODEL_NAME = str(PROJECT_ROOT / "models" / "t5-small")
+
+
+DEFAULT_CONFIG = {
+    # Paths
+    "MERGED_DATA_DIR": str(PROJECT_ROOT / "cache"),
+    "TRAIN_FILE": str(PROJECT_ROOT / "cache" / "train.pkl.lz4"),
+    "VAL_FILE": str(PROJECT_ROOT / "cache" / "val.pkl.lz4"),
+    "TEST_FILE": str(PROJECT_ROOT / "cache" / "test.pkl.lz4"),
+    "VOCAB_PATH": str(PROJECT_ROOT / "vocab.json"),
+    "VOCAB_NMRMIND_PATH": str(PROJECT_ROOT / "vocab_nmrmind.json"),
+    "SAVE_DIR": str(PROJECT_ROOT / "checkpoints"),
+
+    # Tokenizer and feature selection
+    "TOKENIZER_TYPE": "custom",
+    "USE_FORMULA_GUIDANCE": True,
+    "ALL_ATOMS": _DEFAULT_ALL_ATOMS,
+    "FORMULA_VECTOR_SIZE": len(_DEFAULT_ALL_ATOMS),
+    "USE_C_NMR": True,
+    "USE_H_NMR": True,
+    "ENCODER_TYPE": "vanilla_no_pos",
+
+    # Formula encoder
+    "FORMULA_ENCODER_D_MODEL": 512,
+    "FORMULA_ENCODER_N_LAYERS": 2,
+    "FORMULA_ENCODER_N_HEADS": 4,
+    "FORMULA_ENCODER_FF_DIM": 1024,
+    "FORMULA_ENCODER_DROPOUT": 0.1,
+
+    # Data shape
+    "MAX_PEAKS": 60,
+    "MAX_SMILES_LENGTH": _DEFAULT_MAX_SMILES_LENGTH,
+    "MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS": _DEFAULT_MAX_SMILES_LENGTH + 2,
+
+    # Decoder
+    "T5_MODEL_NAME": _DEFAULT_T5_MODEL_NAME,
+    "FREEZE_T5_DECODER": False,
+    "USE_RANDOM_T5_INIT": False,
+    "REMOVE_CROSS_ATTENTION_POSITION_BIAS": True,
+    "SHUFFLE_ENCODER_OUTPUTS": False,
+    "USE_CUSTOM_DECODER": False,
+    "BART_MODEL_NAME": "facebook/bart-base",
+    "FREEZE_BART_DECODER": False,
+    "USE_RANDOM_BART_INIT": False,
+    "BART_D_MODEL": 768,
+    "BART_NUM_LAYERS": 6,
+    "BART_NUM_HEADS": 12,
+
+    # Peak encoder
+    "PEAK_ENCODER_D_MODEL": _infer_t5_d_model(_DEFAULT_T5_MODEL_NAME),
+    "PEAK_ENCODER_N_LAYERS": 6,
+    "PEAK_ENCODER_N_HEADS": 8,
+    "PEAK_ENCODER_FF_DIM": 2048,
+    "PEAK_ENCODER_DROPOUT": 0.1,
+
+    # NMR augmentation
+    "USE_NMR_JITTER": False,
+    "NMR_JITTER_RANGE_C": 2.0,
+    "NMR_JITTER_RANGE_H": 0.2,
+
+    # Optimization
+    "BATCH_SIZE": 1024,
+    "TEST_BATCH_SIZE": 64,
+    "LEARNING_RATE": 1e-4,
+    "EPOCHS": 8000,
+    "GRAD_CLIP": 1.0,
+    "ACCUM_GRAD_BATCHES": 4,
+    "WEIGHT_DECAY": 0.1,
+    "NUM_DATA_WORKERS": 8,
+    "PREFETCH_FACTOR": 2,
+    "LIMIT_VAL_BATCHES": 1.0,
+    "CHECK_VAL_EVERY_N_EPOCH": 20,
+    "TRAIN_EXAMPLE_LIMIT": 3,
+    "TRAIN_EXAMPLE_FREQUENCY": 100,
+
+    # Runtime
+    "ACCELERATOR": "gpu",
+    "DEVICES": 8,
+    "STRATEGY": "ddp_find_unused_parameters_true",
+    "PRECISION": "32",
+    "NUM_SANITY_VAL_STEPS": 0,
+    "LOG_EVERY_N_STEPS": 50,
+    "ENABLE_PROGRESS_BAR": True,
+    "ENABLE_MODEL_SUMMARY": True,
+    "DETERMINISTIC": False,
+
+    # Token IDs populated by prepare_tokenizer()
+    "PAD_TOKEN_ID": None,
+    "BOS_TOKEN_ID": None,
+    "EOS_TOKEN_ID": None,
+    "MASK_TOKEN_ID": None,
+    "UNK_TOKEN_ID": None,
+    "DECODER_START_TOKEN_ID": None,
+
+    # Checkpointing and logging
+    "RESUME_CHECKPOINT": None,
+    "TEST_CKPT_PATH": None,
+    "USE_SWANLAB": False,
+    "SWANLAB_PROJECT": "nmrtrans",
+    "SWANLAB_RUN_NAME": "t5-small",
+    "SWANLAB_INIT_KWARGS": {},
+}
+
+
+_local_config = _load_local_config()
+
+
+def _copy_default(value):
+    return deepcopy(value)
+
+
+def _local_config_keys(local_config):
+    if local_config is None:
+        return set()
+    return {
+        key
+        for key in DEFAULT_CONFIG
+        if hasattr(local_config, key)
     }
-    for key, value in bart_d_model_map.items():
-        if key in name:
-            return value
-    return fallback
-
-# Default paths (will be overridden by config_local.py if it exists)
-_DEFAULT_MERGED_DATA_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/cache/MSD_data"
-_DEFAULT_VOCAB_PATH = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/vocab.json"
-_DEFAULT_SAVE_DIR = "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles/checkpoints_ar"
-
-# Default SwanLab configuration
-_DEFAULT_USE_SWANLAB = True
-_DEFAULT_SWANLAB_PROJECT = "spectra2smiles-ar"
-_DEFAULT_SWANLAB_RUN_NAME = "t5-ar-baseline"
 
 
 class TrainingConfig:
-    """Configuration for Spectra2Smiles-AR training with T5.
-    """
-    
-    # ========== Path Configuration ==========
-    MERGED_DATA_DIR = _get_config("MERGED_DATA_DIR", _DEFAULT_MERGED_DATA_DIR)
-    TRAIN_FILE = os.path.join(MERGED_DATA_DIR, "train.pkl.lz4")
-    VAL_FILE = os.path.join(MERGED_DATA_DIR, "val.pkl.lz4")
-    TEST_FILE = _get_config("TEST_FILE", os.path.join(MERGED_DATA_DIR, "test.pkl.lz4"))
-    
-    VOCAB_PATH = _get_config("VOCAB_PATH", _DEFAULT_VOCAB_PATH)
-    
-    # ========== Tokenizer Configuration ==========
-    TOKENIZER_TYPE = _get_config("TOKENIZER_TYPE", "custom") # "custom" or "nmrmind"
-    VOCAB_NMRMIND_PATH = _get_config("VOCAB_NMRMIND_PATH", "/mnt/shared-storage-user/yangzhuo/main/projects/slm/Spectra2Smiles-AR/Spectra2Smiles-AR/vocab_nmrmind.json")
-    
-    SAVE_DIR = _get_config("SAVE_DIR", _DEFAULT_SAVE_DIR)
-    
-    # ========== Data Configuration ==========
-    
-    # ===== 新增：分子式指导配置 =====
-    USE_FORMULA_GUIDANCE = _get_config("USE_FORMULA_GUIDANCE", True)
-    ALL_ATOMS = ['B', 'Br', 'C', 'Cl', 'F', 'H', 'I', 'N', 'O', 'P', 'S', 'Si']
-    FORMULA_VECTOR_SIZE = len(ALL_ATOMS)  # 12
-    
-    # ===== 消融实验配置：控制使用的NMR模态 =====
-    USE_C_NMR = _get_config("USE_C_NMR", True)  # 是否使用 C-NMR
-    USE_H_NMR = _get_config("USE_H_NMR", True)  # 是否使用 H-NMR
+    """Configuration for NMRTrans training and evaluation."""
 
-        # 消融实验配置
-    ENCODER_TYPE = _get_config("ENCODER_TYPE", "vanilla_no_pos")  # 可选: "set_transformer", "vanilla_pos", "vanilla_no_pos"
+    def __init__(self, local_config=_USE_MODULE_LOCAL_CONFIG):
+        if local_config is _USE_MODULE_LOCAL_CONFIG:
+            local_config = _local_config
 
-    
-    # Formula encoder 配置
-    FORMULA_ENCODER_D_MODEL = 512  # 与 peak encoder 相同
-    FORMULA_ENCODER_N_LAYERS = 2
-    FORMULA_ENCODER_N_HEADS = 4
-    FORMULA_ENCODER_FF_DIM = 1024
-    FORMULA_ENCODER_DROPOUT = 0.1
+        explicit_keys = _local_config_keys(local_config)
+        for key, default in DEFAULT_CONFIG.items():
+            value = getattr(local_config, key) if key in explicit_keys else _copy_default(default)
+            setattr(self, key, value)
 
-    # AR project only uses NMR peaks (discrete)
-    MAX_PEAKS = _get_config("MAX_PEAKS", 60)  # Maximum number of peaks per spectrum
-    MAX_SMILES_LENGTH = 80
-    MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS = MAX_SMILES_LENGTH + 2  # +2 for <bos> and <eos>
-    
-    # ========== T5 Model Configuration ==========
-    T5_MODEL_NAME = _get_config("T5_MODEL_NAME", "t5-small")  # t5-small, t5-base, t5-large
-    FREEZE_T5_DECODER = _get_config("FREEZE_T5_DECODER", False)
-    USE_RANDOM_T5_INIT = _get_config("USE_RANDOM_T5_INIT", False)
-    REMOVE_CROSS_ATTENTION_POSITION_BIAS = _get_config("REMOVE_CROSS_ATTENTION_POSITION_BIAS", True) # 移除cross-attention的位置偏置
-    SHUFFLE_ENCODER_OUTPUTS = _get_config("SHUFFLE_ENCODER_OUTPUTS", False) # 训练时随机打乱encoder输出
-    USE_CUSTOM_DECODER = _get_config("USE_CUSTOM_DECODER", False)    
-    
-    # ========== BART Model Configuration ==========
-    BART_MODEL_NAME = _get_config("BART_MODEL_NAME", "facebook/bart-base")  # 或 "facebook/bart-large"
-    FREEZE_BART_DECODER = _get_config("FREEZE_BART_DECODER", False)
-    USE_RANDOM_BART_INIT = _get_config("USE_RANDOM_BART_INIT", False)
-    BART_D_MODEL = _get_config("BART_D_MODEL", 768)  # BART-base 的 hidden size
-    BART_NUM_LAYERS = _get_config("BART_NUM_LAYERS", 6)
-    BART_NUM_HEADS = _get_config("BART_NUM_HEADS", 12)
+        _refresh_derived_values(self, explicit_keys=explicit_keys)
 
-    # ========== Peak Encoder Configuration ==========
-    PEAK_ENCODER_D_MODEL = _get_config(
-        "PEAK_ENCODER_D_MODEL",
-        _infer_t5_d_model(_get_config("T5_MODEL_NAME", "t5-small")),
-        # _infer_bart_d_model(_get_config("BART_MODEL_NAME", "facebook/bart-base")),
-    )
-    PEAK_ENCODER_N_LAYERS = _get_config("PEAK_ENCODER_N_LAYERS", 6)  # 增加到6层
-    PEAK_ENCODER_N_HEADS = _get_config("PEAK_ENCODER_N_HEADS", 8)  # 增加注意力头
-    PEAK_ENCODER_FF_DIM = _get_config("PEAK_ENCODER_FF_DIM", 2048)  # 增加FFN维度
-    PEAK_ENCODER_DROPOUT = _get_config("PEAK_ENCODER_DROPOUT", 0.1)  # 添加 dropout
-    # ========== NMR Augmentation ==========
-    USE_NMR_JITTER = _get_config("USE_NMR_JITTER", False)
-    NMR_JITTER_RANGE_C = _get_config("NMR_JITTER_RANGE_C", 2.0)
-    NMR_JITTER_RANGE_H = _get_config("NMR_JITTER_RANGE_H", 0.2)
-    
-    # ========== Training Hyperparameters ==========
-    BATCH_SIZE = _get_config("BATCH_SIZE", 1024)
-    TEST_BATCH_SIZE = _get_config("TEST_BATCH_SIZE", 64)
-    LEARNING_RATE = _get_config("LEARNING_RATE", 1e-4)
-    EPOCHS = _get_config("EPOCHS", 8000)
-    GRAD_CLIP = _get_config("GRAD_CLIP", 1.0)
-    ACCUM_GRAD_BATCHES = _get_config("ACCUM_GRAD_BATCHES", 4)
-    WEIGHT_DECAY = _get_config("WEIGHT_DECAY", 0.1)
-    
-    # Data loading
-    NUM_DATA_WORKERS = _get_config("NUM_DATA_WORKERS", 8)
-    PREFETCH_FACTOR = _get_config("PREFETCH_FACTOR", 2)
-    
-    # Validation
-    LIMIT_VAL_BATCHES = _get_config("LIMIT_VAL_BATCHES", 1.0)
-    CHECK_VAL_EVERY_N_EPOCH = _get_config("CHECK_VAL_EVERY_N_EPOCH", 20)
-    
-    # Logging
-    TRAIN_EXAMPLE_LIMIT = _get_config("TRAIN_EXAMPLE_LIMIT", 3)
-    TRAIN_EXAMPLE_FREQUENCY = _get_config("TRAIN_EXAMPLE_FREQUENCY", 100)
-    
-    # ========== Device Configuration ==========
-    DEVICES = _get_config("DEVICES", 8)  # Number of GPUs
-    PRECISION = _get_config("PRECISION", "32")  # "16-mixed", "bf16-mixed", "32"
-    
-    # ========== Special Token IDs ==========
-    # These will be set by prepare_tokenizer()
-    PAD_TOKEN_ID = None
-    BOS_TOKEN_ID = None
-    EOS_TOKEN_ID = None
-    MASK_TOKEN_ID = None
-    UNK_TOKEN_ID = None
-    DECODER_START_TOKEN_ID = None
-    
-    # ========== Checkpoint Configuration ==========
-    RESUME_CHECKPOINT = _get_config("RESUME_CHECKPOINT", None)
-    TEST_CKPT_PATH = _get_config("TEST_CKPT_PATH", None)
-    
-    # ========== SwanLab Configuration ==========
-    USE_SWANLAB = _get_config("USE_SWANLAB", _DEFAULT_USE_SWANLAB)
-    SWANLAB_PROJECT = _get_config("SWANLAB_PROJECT", _DEFAULT_SWANLAB_PROJECT)
-    SWANLAB_RUN_NAME = _get_config("SWANLAB_RUN_NAME", _DEFAULT_SWANLAB_RUN_NAME)
-    SWANLAB_INIT_KWARGS = _get_config("SWANLAB_INIT_KWARGS", {})
+
+for _config_key, _config_default in DEFAULT_CONFIG.items():
+    setattr(TrainingConfig, _config_key, _copy_default(_config_default))
+
+
+_PATH_KEYS = {
+    "MERGED_DATA_DIR",
+    "VOCAB_PATH",
+    "VOCAB_NMRMIND_PATH",
+    "SAVE_DIR",
+    "TEST_FILE",
+    "RESUME_CHECKPOINT",
+    "TEST_CKPT_PATH",
+    "T5_MODEL_NAME",
+}
+
+
+def _resolve_config_path(value, base_dir: Path):
+    """Resolve relative filesystem paths while leaving simple model names untouched."""
+    if value in (None, ""):
+        return value
+
+    value_str = str(value)
+    if value_str in {"t5-small", "t5-base", "t5-large"}:
+        return value
+
+    path = Path(value_str)
+    if path.is_absolute():
+        return value_str
+
+    return str((base_dir / path).resolve())
+
+
+def _refresh_derived_values(config: TrainingConfig, explicit_keys=None):
+    """Refresh fields that depend on other config values."""
+    explicit_keys = set(explicit_keys or [])
+    config.TRAIN_FILE = os.path.join(config.MERGED_DATA_DIR, "train.pkl.lz4")
+    config.VAL_FILE = os.path.join(config.MERGED_DATA_DIR, "val.pkl.lz4")
+
+    if "TEST_FILE" not in explicit_keys:
+        config.TEST_FILE = os.path.join(config.MERGED_DATA_DIR, "test.pkl.lz4")
+
+    config.FORMULA_VECTOR_SIZE = len(config.ALL_ATOMS)
+    config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS = config.MAX_SMILES_LENGTH + 2
+
+    if "PEAK_ENCODER_D_MODEL" not in explicit_keys:
+        config.PEAK_ENCODER_D_MODEL = _infer_t5_d_model(config.T5_MODEL_NAME)
+
+
+def apply_config_overrides(config: TrainingConfig, overrides: dict, base_dir=None):
+    """Apply YAML overrides to a TrainingConfig instance."""
+    if overrides is None:
+        return config
+    if not isinstance(overrides, dict):
+        raise TypeError("Config overrides must be a dictionary")
+
+    base_dir = Path(base_dir or PROJECT_ROOT)
+    explicit_keys = set()
+
+    for key, value in overrides.items():
+        if not hasattr(config, key):
+            raise KeyError(f"Unknown config key: {key}")
+
+        if key in _PATH_KEYS:
+            value = _resolve_config_path(value, base_dir)
+
+        setattr(config, key, value)
+        explicit_keys.add(key)
+
+    _refresh_derived_values(config, explicit_keys=explicit_keys)
+    return config
+
+
+def load_training_config(
+    config_path=None,
+    base_dir=None,
+    logger=None,
+    local_config=_USE_MODULE_LOCAL_CONFIG,
+) -> TrainingConfig:
+    """Create TrainingConfig and optionally overlay values from a single YAML file."""
+    config = TrainingConfig(local_config=None if config_path is not None else local_config)
+    if config_path is None:
+        return config
+
+    try:
+        from omegaconf import OmegaConf
+    except ImportError as exc:
+        raise RuntimeError("hydra-core/omegaconf is required to load YAML config files") from exc
+
+    base_dir = Path(base_dir or PROJECT_ROOT)
+    config_path = Path(config_path)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
+
+    loaded = OmegaConf.load(config_path)
+    overrides = OmegaConf.to_container(loaded, resolve=True)
+    apply_config_overrides(config, overrides, base_dir=base_dir)
+
+    if logger:
+        logger.info(f"Loaded YAML config: {config_path}")
+
+    return config
 
 
 def prepare_tokenizer(config: TrainingConfig, logger: logging.Logger):

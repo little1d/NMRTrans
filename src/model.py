@@ -13,7 +13,13 @@ from collections import Counter
 import json
 logger = logging.getLogger(__name__)
 from rdkit import Chem, DataStructs, rdBase
-from rdkit.Chem import AllChem
+from rdkit.Chem import rdFingerprintGenerator
+
+MORGAN_GENERATOR_CHIRAL = rdFingerprintGenerator.GetMorganGenerator(
+    radius=2,
+    fpSize=2048,
+    includeChirality=True,
+)
 
 # ===========================================================
 # 1. PeakEncoder —— 用于 H-NMR 与 C-NMR
@@ -902,8 +908,8 @@ class NMR2SMILESModel(pl.LightningModule):
                 acc = 1.0
             
             # Tanimoto Similarity
-            fp_1 = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048, useChirality=True)
-            fp_2 = AllChem.GetMorganFingerprintAsBitVect(origin_mol, 2, nBits=2048, useChirality=True)
+            fp_1 = MORGAN_GENERATOR_CHIRAL.GetFingerprint(pred_mol)
+            fp_2 = MORGAN_GENERATOR_CHIRAL.GetFingerprint(origin_mol)
             similarity = DataStructs.TanimotoSimilarity(fp_1, fp_2)
         except Exception as e:
             # logger.warning(f"RDKit evaluation error: {e}")
