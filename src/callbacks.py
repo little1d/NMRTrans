@@ -111,7 +111,7 @@ class BestModelCheckpoint(ModelCheckpoint):
         monitor: str = "val_seq_acc",
         mode: str = "max",
         save_top_k: int = 3,
-        filename: str = "full-ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
+        filename: str = "ar-{epoch:02d}-step={step}-valacc={val_seq_acc:.4f}",
         **kwargs
     ):
         super().__init__(
@@ -122,7 +122,8 @@ class BestModelCheckpoint(ModelCheckpoint):
             filename=filename,
             save_weights_only=False,
             every_n_epochs=5,
-            save_on_train_epoch_end=True,
+            save_on_train_epoch_end=False,
+            enable_version_counter=False,
             **kwargs
         )
         self.best_model_path = None
@@ -239,7 +240,7 @@ def get_default_callbacks(config, save_dir: str):
             monitor="val_seq_acc",
             mode="max",
             save_top_k=3,
-            filename="ar-{epoch:02d}-valacc={val_seq_acc:.4f}",
+            filename="ar-{epoch:02d}-step={step}-valacc={val_seq_acc:.4f}",
         ),
     ]
     

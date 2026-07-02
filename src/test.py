@@ -9,12 +9,12 @@ import time
 import warnings
 import json
 import re
-from typing import Dict, List
-from collections import defaultdict
+from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 # Add parent directory to path for imports
@@ -27,8 +27,9 @@ src_path = os.path.dirname(os.path.abspath(__file__))
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from config import TrainingConfig, prepare_tokenizer
+from config import TrainingConfig, load_training_config, prepare_tokenizer
 from data import MergedDataset
+from features import peaks_collate_fn
 from model import NMR2SMILESModel
 
 # Environment setup
@@ -62,7 +63,7 @@ logger = logging.getLogger(__name__)
 try:
     from rdkit import Chem
     from rdkit import DataStructs
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdFingerprintGenerator
     from rdkit import RDLogger
     
     # Disable RDKit error/warning messages to stderr
@@ -72,13 +73,16 @@ try:
     RDLogger.DisableLog('rdApp.debug')
     
     RDKit_AVAILABLE = True
+    MORGAN_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
     logger.info("RDKit is available. SMILES validity and similarity will be checked.")
 except ImportError:
     logger.warning("RDKit is not installed. Cannot validate SMILES or calculate similarity. Please run `pip install rdkit` to enable this feature.")
     RDKit_AVAILABLE = False
+    MORGAN_GENERATOR = None
 except AttributeError:
     # Older versions of RDKit might not have RDLogger
     RDKit_AVAILABLE = True
+    MORGAN_GENERATOR = None
     logger.info("RDKit is available. SMILES validity and similarity will be checked.")
 
 def is_valid_smiles(smiles: str) -> bool:
@@ -135,9 +139,11 @@ def calculate_smiles_similarity(smiles1: str, smiles2: str) -> float:
         if mol1 is None or mol2 is None:
             return -1.0
         
-        # Generate Morgan fingerprints (radius=2, 2048 bits)
-        fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, radius=2, nBits=2048)
-        fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, radius=2, nBits=2048)
+        if MORGAN_GENERATOR is None:
+            return -1.0
+
+        fp1 = MORGAN_GENERATOR.GetFingerprint(mol1)
+        fp2 = MORGAN_GENERATOR.GetFingerprint(mol2)
         
         # Calculate Tanimoto similarity
         similarity = DataStructs.TanimotoSimilarity(fp1, fp2)
@@ -150,221 +156,25 @@ def calculate_smiles_similarity(smiles1: str, smiles2: str) -> float:
         # Catch any other exceptions
         return -1.0
 
-def pad_peak_sequences(peak_sequences, max_peaks):
-    """Pad peak sequences to the same length and return mask (1=valid, 0=pad)."""
-    batch_size = len(peak_sequences)
-    max_len = min(max(len(seq) for seq in peak_sequences), max_peaks)
-    
-    # Create padded tensor with shape [batch_size, max_peaks, 1]
-    padded = torch.zeros(batch_size, max_peaks, 1)
-    mask = torch.zeros(batch_size, max_peaks, dtype=torch.long)
-    
-    for i, peaks in enumerate(peak_sequences):
-        num_peaks = min(len(peaks), max_peaks)
-        if num_peaks > 0:
-            padded[i, :num_peaks] = peaks[:num_peaks]
-            mask[i, :num_peaks] = 1
-    
-    return padded, mask
+def shard_indices(total_size: int, num_shards: int, shard_index: int):
+    """Return deterministic round-robin indices for one evaluation shard."""
+    if num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
+    if total_size < 0:
+        raise ValueError("total_size must be non-negative")
+    return list(range(shard_index, total_size, num_shards))
 
-def parse_chemical_formula(formula: str) -> dict:
-    """Parse chemical formula string to atom counts dictionary."""
-    if not formula or formula.strip() == "":
-        return {}
-    
-    formula = formula.strip()
-    pattern = r'([A-Z][a-z]?)(\d*)'
-    matches = re.findall(pattern, formula)
-    
-    atom_counts = defaultdict(int)
-    for atom, count in matches:
-        count = int(count) if count else 1
-        atom_counts[atom] += count
-    
-    return dict(atom_counts)
 
-def parse_chemical_formula_to_vector(formula: str, atom_mapping: dict) -> torch.Tensor:
-    """Convert chemical formula to atom count vector"""
-    if not formula or formula.strip() == "":
-        return torch.zeros(len(atom_mapping), dtype=torch.float)
-    
-    atoms = parse_chemical_formula(formula)
-    vec = torch.zeros(len(atom_mapping), dtype=torch.float)
-    for atom, count in atoms.items():
-        if atom in atom_mapping:
-            idx = atom_mapping[atom]
-            vec[idx] = float(count)
-    
-    return vec
-
-def pad_j_coupling(j_coupling_list, max_j=6):
-    """Pad J-coupling list to fixed length"""
-    if not isinstance(j_coupling_list, list):
-        j_coupling_list = []
-    
-    padded = [0.0] * max_j
-    for i, val in enumerate(j_coupling_list[:max_j]):
-        try:
-            padded[i] = float(val)
-        except (TypeError, ValueError):
-            padded[i] = 0.0
-    return padded
-
-def prepare_h_nmr_features(tokenized_input_str, split_vocab):
-    """Prepare 1HNMR features from tokenized_input string (with width)"""
-    try:
-        tokenized_input = json.loads(tokenized_input_str)
-        h_nmr_data = tokenized_input.get("1HNMR", [])
-        
-        features = []
-        for peak in h_nmr_data:
-            if len(peak) < 5:
-                continue
-            
-            chem_shift = float(peak[0])
-            peak_width = float(peak[1])
-            
-            split_str = str(peak[2]).strip().lower() if len(peak) > 2 else "<unk>"
-            split_idx = split_vocab.get(split_str, split_vocab.get('<unk>', 0))
-            
-            integral_str = str(peak[3]).strip() if len(peak) > 3 else '1H'
-            integral_value = 1.0
-            match = re.search(r'(\d+)(?:H|h)?', integral_str)
-            if match:
-                integral_value = float(match.group(1))
-            
-            j_coupling = peak[4] if len(peak) > 4 and isinstance(peak[4], list) else []
-            padded_j = pad_j_coupling(j_coupling)
-            
-            peak_features = [chem_shift, peak_width, split_idx, integral_value] + padded_j
-            features.append(peak_features)
-        
-        return features
-        
-    except Exception as e:
-        logger.warning(f"Error preparing H-NMR features: {str(e)}")
-        return []
-
-def peaks_collate_fn(batch, tokenizer, config, atom_mapping=None, enabled_features=None):
-    """
-    Collate function for NMR peak datasets (updated for 10-dim H-NMR input)
-    
-    Args:
-        batch: List of samples
-        tokenizer: Tokenizer instance
-        config: TrainingConfig instance
-        atom_mapping: Atom mapping for formula encoding (optional)
-        enabled_features: Set of enabled features, e.g., {'c_nmr', 'h_nmr', 'formula'}
-                        If None, processes all available features
-    
-    H-NMR Feature Format (10 dimensions):
-        [chem_shift, peak_width, split_idx, integral_value, j1, j2, j3, j4, j5, j6]
-         0           1            2          3              4-9
-    """
-    batch = [b for b in batch if b is not None]
-    if not batch:
-        return None
-    
-    # Default: process all features if not specified
-    if enabled_features is None:
-        enabled_features = {'c_nmr', 'h_nmr', 'formula'}
-    
-    # 1. Process SMILES
-    original_smiles_list = [item["original_smiles"] for item in batch]
-    tokenized_smiles = []
-    for smiles in original_smiles_list:
-        tokens = tokenizer.encode(
-            smiles, 
-            max_length=config.MAX_SMILES_LENGTH, 
-            add_special_tokens=True
-        )
-        tokenized_smiles.append(tokens)
-    
-    max_len = config.MAX_SMILES_LENGTH_WITH_SPECIAL_TOKENS
-    padded_smiles = []
-    for tokens in tokenized_smiles:
-        padded = tokens + [tokenizer.vocab["<pad>"]] * (max_len - len(tokens))
-        padded_smiles.append(padded)
-    
-    smiles_tensor = torch.tensor(padded_smiles, dtype=torch.long)
-    
-    # 2. Process spectrum data (only for enabled features)
-    spectra_data = {}
-    
-    split_vocab = {
-        '<unk>': 0, 'm': 1, 'd': 2, 's': 3, 'dd': 4, 't': 5, 'ddd': 6, 'q': 7,
-        'dt': 8, 'td': 9, 'br': 10, 'ddt': 11, 'dq': 12, 'tt': 13, 'quint': 14,
-        'dddd': 15, 'qd': 16, 'sept': 17, 'ddp': 18, 'ddq': 19, 'bd': 20, 'dqd': 21,
-    }
-    
-    # H-NMR processing (using prepare_h_nmr_features like training code)
-    if 'h_nmr' in enabled_features and any("tokenized_input" in item for item in batch):
-        h_features_list = []
-        max_peaks = 0
-        
-        for item in batch:
-            tokenized_input_str = item.get("tokenized_input", "")
-            h_features = prepare_h_nmr_features(tokenized_input_str, split_vocab)
-            max_peaks = max(max_peaks, len(h_features))
-            h_features_list.append(h_features)
-        
-        # Pad to config.MAX_PEAKS
-        max_peaks = min(max_peaks, config.MAX_PEAKS)
-        
-        # Create tensor (B, L, 10) where 10 = [chem_shift, width, split_idx, integral, j1-j6]
-        H_NMR_FEATURE_DIM = 10
-        h_features_tensor = torch.zeros(len(batch), max_peaks, H_NMR_FEATURE_DIM)
-        h_mask = torch.zeros(len(batch), max_peaks, dtype=torch.long)
-        
-        for i, features in enumerate(h_features_list):
-            num_peaks = min(len(features), max_peaks)
-            if num_peaks > 0:
-                for j in range(num_peaks):
-                    if len(features[j]) == H_NMR_FEATURE_DIM:
-                        h_features_tensor[i, j] = torch.tensor(features[j])
-                    else:
-                        logger.warning(f"Feature dimension mismatch: expected {H_NMR_FEATURE_DIM}, got {len(features[j])}")
-                h_mask[i, :num_peaks] = 1
-        
-        spectra_data["h_nmr_features"] = h_features_tensor
-        spectra_data["h_nmr_mask"] = h_mask
-    
-    # C-NMR processing (with normalization like training code)
-    if 'c_nmr' in enabled_features and "c_nmr_peaks" in batch[0] and batch[0]["c_nmr_peaks"] is not None:
-        c_peaks_list = []
-        for item in batch:
-            if item["c_nmr_peaks"] is not None and len(item["c_nmr_peaks"]) > 0:
-                c_peaks_tensor = torch.tensor(item["c_nmr_peaks"], dtype=torch.float)
-                # Normalize to [0, 1] range (same as training code)
-                c_peaks_tensor = c_peaks_tensor.unsqueeze(-1)
-                c_peaks_tensor = torch.clamp(c_peaks_tensor / 220.0, 0.0, 1.0)
-                c_peaks_list.append(c_peaks_tensor)
-            else:
-                c_peaks_list.append(torch.zeros((0, 1)))
-        c_peaks_padded, c_mask = pad_peak_sequences(c_peaks_list, config.MAX_PEAKS)
-        spectra_data["c_nmr_peaks"] = c_peaks_padded
-        spectra_data["c_nmr_mask"] = c_mask
-    
-    # Process formula vector
-    if 'formula' in enabled_features and config.USE_FORMULA_GUIDANCE and atom_mapping is not None:
-        formula_vectors = []
-        for item in batch:
-            # Handle missing molecular_formula field gracefully
-            formula = item.get("molecular_formula", "")
-            if formula is None:
-                formula = ""
-            vec = parse_chemical_formula_to_vector(formula, atom_mapping)
-            formula_vectors.append(vec)
-        formula_tensor = torch.stack(formula_vectors)
-        spectra_data["formula_vector"] = formula_tensor
-    
-    return {
-        "smiles": smiles_tensor,
-        "original_smiles": original_smiles_list,
-        **spectra_data
-    }
-
-def build_test_dataloader(config: TrainingConfig, tokenizer, test_file=None, enabled_features=None):
+def build_test_dataloader(
+    config: TrainingConfig,
+    tokenizer,
+    test_file=None,
+    enabled_features=None,
+    shard_index: int = 0,
+    num_shards: int = 1,
+):
     """
     Build test data loader
     
@@ -374,6 +184,8 @@ def build_test_dataloader(config: TrainingConfig, tokenizer, test_file=None, ena
         test_file: Path to test file (optional)
         enabled_features: Set of enabled features, e.g., {'c_nmr', 'formula'}
                          If None, uses all features based on model configuration
+        shard_index: Evaluation shard rank.
+        num_shards: Number of evaluation shards.
     """
     # Use provided test_file or fall back to config.TEST_FILE
     test_file_path = test_file or config.TEST_FILE
@@ -382,12 +194,12 @@ def build_test_dataloader(config: TrainingConfig, tokenizer, test_file=None, ena
     if not os.path.exists(test_file_path):
         raise FileNotFoundError(f"Test file not found: {test_file_path}")
     
-    test_dataset = MergedDataset(test_file_path)
-    logger.info(f"Test set size: {len(test_dataset)}")
+    full_dataset = MergedDataset(test_file_path)
+    logger.info(f"Test set size: {len(full_dataset)}")
     
     # Check data structure
-    if len(test_dataset) > 0:
-        sample = test_dataset[0]
+    if len(full_dataset) > 0:
+        sample = full_dataset[0]
         logger.info(f"Sample keys: {list(sample.keys())}")
         has_source = "source" in sample
         has_formula = "molecular_formula" in sample
@@ -397,6 +209,15 @@ def build_test_dataloader(config: TrainingConfig, tokenizer, test_file=None, ena
         logger.info(f"  - Has 'molecular_formula' field: {has_formula}")
         logger.info(f"  - Has 'h_nmr_peaks' field: {has_h_nmr}")
         logger.info(f"  - Has 'c_nmr_peaks' field: {has_c_nmr}")
+
+    test_dataset = full_dataset
+    if num_shards > 1:
+        indices = shard_indices(len(full_dataset), num_shards, shard_index)
+        test_dataset = Subset(full_dataset, indices)
+        logger.info(
+            f"Evaluation shard {shard_index + 1}/{num_shards}: "
+            f"{len(indices)} samples"
+        )
     
     # Create atom mapping for formula
     atom_mapping = None
@@ -446,7 +267,13 @@ def get_model_module(model):
         return model.module
     return model
 
-def load_model(config: TrainingConfig, tokenizer, checkpoint_path: str):
+def load_model(
+    config: TrainingConfig,
+    tokenizer,
+    checkpoint_path: str,
+    device: torch.device | str | None = None,
+    use_data_parallel: bool = True,
+):
     """Load trained model"""
     logger.info(f"\n===== Loading Model =====")
     logger.info(f"Checkpoint: {checkpoint_path}")
@@ -519,6 +346,15 @@ def load_model(config: TrainingConfig, tokenizer, checkpoint_path: str):
     else:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
+    if device is not None:
+        device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"Requested CUDA device {device}, but CUDA is not available")
+        model = model.to(device)
+        model.eval()
+        logger.info(f"Model loaded to {device}")
+        return model
+
     # Determine device and setup multi-GPU if available
     if not torch.cuda.is_available():
         device = torch.device("cpu")
@@ -531,7 +367,7 @@ def load_model(config: TrainingConfig, tokenizer, checkpoint_path: str):
     num_gpus = torch.cuda.device_count()
     logger.info(f"Detected {num_gpus} GPU(s)")
     
-    if num_gpus > 1:
+    if use_data_parallel and num_gpus > 1:
         # DataParallel requires model to be on cuda:0, then it distributes to all GPUs
         device = torch.device("cuda:0")
         model = model.to(device)
@@ -544,6 +380,7 @@ def load_model(config: TrainingConfig, tokenizer, checkpoint_path: str):
         gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
         logger.info(f"Using {num_gpus} GPUs for parallel inference: {', '.join(gpu_list)}")
         logger.info(f"Primary device: {device}")
+        logger.info("For true multi-GPU generation over the test set, use --parallel_eval.")
     else:
         device = torch.device("cuda:0")
         model = model.to(device)
@@ -932,7 +769,11 @@ def print_results(results, enabled_features=None):
     if metrics.get("teacher_forcing_sequence_accuracy") is not None:
         logger.info(f"  TF Sequence Accuracy (teacher forcing): {metrics['teacher_forcing_sequence_accuracy']:.4f}")
     if metrics.get("topk_sequence_accuracy"):
-        topk_str = ", ".join([f"top{k}: {metrics['topk_sequence_accuracy'][k]:.4f}" for k in sorted(metrics["topk_sequence_accuracy"].keys())])
+        topk_items = sorted(
+            metrics["topk_sequence_accuracy"].items(),
+            key=lambda item: int(item[0]),
+        )
+        topk_str = ", ".join([f"top{k}: {value:.4f}" for k, value in topk_items])
         logger.info(f"  Beam Search Seq Acc ({topk_str})")
     logger.info(f"  Total Samples: {metrics['total_samples']}")
     
@@ -984,6 +825,327 @@ def parse_features(features_str):
     
     return features
 
+
+def resolve_enabled_features(requested_features, model_module):
+    """Resolve final evaluation features from CLI override or model encoders."""
+    if requested_features is None:
+        enabled_features = set()
+        if model_module.c_encoder is not None:
+            enabled_features.add("c_nmr")
+        if model_module.h_encoder is not None:
+            enabled_features.add("h_nmr")
+        if model_module.formula_encoder is not None:
+            enabled_features.add("formula")
+        return enabled_features
+
+    if "c_nmr" in requested_features and model_module.c_encoder is None:
+        raise ValueError(
+            "Feature 'c_nmr' is requested but model does not have c_encoder. "
+            "Please check your checkpoint or use different features."
+        )
+    if "h_nmr" in requested_features and model_module.h_encoder is None:
+        raise ValueError(
+            "Feature 'h_nmr' is requested but model does not have h_encoder. "
+            "Please check your checkpoint or use different features."
+        )
+    if "formula" in requested_features and model_module.formula_encoder is None:
+        raise ValueError(
+            "Feature 'formula' is requested but model does not have formula_encoder. "
+            "Please check your checkpoint or use different features."
+        )
+    if not ("c_nmr" in requested_features or "h_nmr" in requested_features):
+        raise ValueError(
+            "At least one NMR feature (c_nmr or h_nmr) must be enabled. "
+            f"Specified features: {requested_features}"
+        )
+
+    return set(requested_features)
+
+
+def _weighted_average(shard_results, metric_key, count_key="total_samples"):
+    weighted_sum = 0.0
+    count_sum = 0
+    for result in shard_results:
+        metrics = result["metrics"]
+        value = metrics.get(metric_key)
+        count = int(metrics.get(count_key, 0))
+        if value is None or count <= 0:
+            continue
+        weighted_sum += float(value) * count
+        count_sum += count
+    if count_sum == 0:
+        return None
+    return weighted_sum / count_sum
+
+
+def merge_evaluation_results(shard_results):
+    """Merge independently evaluated dataset shards into one result payload."""
+    if not shard_results:
+        raise ValueError("No shard results to merge")
+
+    total_samples = sum(int(result["metrics"].get("total_samples", 0)) for result in shard_results)
+    if total_samples <= 0:
+        raise ValueError("No samples were evaluated across shards")
+
+    similarity_samples = sum(int(result["metrics"].get("similarity_samples", 0)) for result in shard_results)
+    tanimoto_similarity = None
+    if similarity_samples > 0:
+        tanimoto_similarity = sum(
+            float(result["metrics"]["tanimoto_similarity"]) * int(result["metrics"].get("similarity_samples", 0))
+            for result in shard_results
+            if result["metrics"].get("tanimoto_similarity") is not None
+        ) / similarity_samples
+
+    examples = []
+    for result in shard_results:
+        examples.extend(result["metrics"].get("examples", []))
+
+    topk_keys = set()
+    for result in shard_results:
+        topk_keys.update(result["metrics"].get("topk_sequence_accuracy", {}).keys())
+    topk_sequence_accuracy = {}
+    for key in sorted(topk_keys, key=lambda item: int(item)):
+        weighted_sum = 0.0
+        count_sum = 0
+        for result in shard_results:
+            metrics = result["metrics"]
+            topk = metrics.get("topk_sequence_accuracy", {})
+            if key in topk:
+                value = topk[key]
+            elif str(key) in topk:
+                value = topk[str(key)]
+            else:
+                continue
+            count = int(metrics.get("total_samples", 0))
+            weighted_sum += float(value) * count
+            count_sum += count
+        if count_sum > 0:
+            topk_sequence_accuracy[int(key)] = weighted_sum / count_sum
+
+    merged_metrics = {
+        "token_accuracy": _weighted_average(shard_results, "token_accuracy"),
+        "sequence_accuracy": _weighted_average(shard_results, "sequence_accuracy"),
+        "valid_smiles_ratio": _weighted_average(shard_results, "valid_smiles_ratio"),
+        "tanimoto_similarity": tanimoto_similarity,
+        "similarity_samples": similarity_samples,
+        "total_samples": total_samples,
+        "examples": examples[:100],
+        "teacher_forcing_token_accuracy": _weighted_average(
+            shard_results,
+            "teacher_forcing_token_accuracy",
+        ),
+        "teacher_forcing_sequence_accuracy": _weighted_average(
+            shard_results,
+            "teacher_forcing_sequence_accuracy",
+        ),
+        "topk_sequence_accuracy": topk_sequence_accuracy,
+    }
+
+    group_names = []
+    for result in shard_results:
+        for group_name in result.get("grouped_metrics", {}):
+            if group_name not in group_names:
+                group_names.append(group_name)
+
+    grouped_metrics = {}
+    for group_name in group_names:
+        group_count = 0
+        accumulators = {
+            "token_acc": 0.0,
+            "seq_acc": 0.0,
+            "valid_ratio": 0.0,
+            "similarity": 0.0,
+        }
+        similarity_count = 0
+
+        for result in shard_results:
+            group = result.get("grouped_metrics", {}).get(group_name)
+            if not group:
+                continue
+            count = int(group.get("sample_count", 0))
+            if count <= 0:
+                continue
+            group_count += count
+            accumulators["token_acc"] += float(group.get("token_acc", 0.0)) * count
+            accumulators["seq_acc"] += float(group.get("seq_acc", 0.0)) * count
+            accumulators["valid_ratio"] += float(group.get("valid_ratio", 0.0)) * count
+            if group.get("similarity") is not None:
+                accumulators["similarity"] += float(group["similarity"]) * count
+                similarity_count += count
+
+        if group_count == 0:
+            continue
+        grouped_metrics[group_name] = {
+            "sample_count": group_count,
+            "token_acc": accumulators["token_acc"] / group_count,
+            "seq_acc": accumulators["seq_acc"] / group_count,
+            "valid_ratio": accumulators["valid_ratio"] / group_count,
+        }
+        if similarity_count > 0:
+            grouped_metrics[group_name]["similarity"] = accumulators["similarity"] / similarity_count
+
+    return {
+        "metrics": merged_metrics,
+        "grouped_metrics": grouped_metrics,
+        "inference_time": max(float(result.get("inference_time", 0.0)) for result in shard_results),
+    }
+
+
+def _json_safe(value: Any):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def save_results(config, results, test_file_path, checkpoint_path, enabled_features):
+    """Save metrics and examples in the existing output format."""
+    os.makedirs(config.SAVE_DIR, exist_ok=True)
+    metrics = results["metrics"]
+
+    saved_metrics = {
+        "token_accuracy": float(metrics["token_accuracy"]),
+        "sequence_accuracy": float(metrics["sequence_accuracy"]),
+        "valid_smiles_ratio": float(metrics["valid_smiles_ratio"]),
+        "tanimoto_similarity": (
+            float(metrics["tanimoto_similarity"])
+            if metrics.get("tanimoto_similarity") is not None
+            else None
+        ),
+        "similarity_samples": int(metrics.get("similarity_samples", 0)),
+        "total_samples": int(metrics["total_samples"]),
+    }
+    for key in (
+        "teacher_forcing_token_accuracy",
+        "teacher_forcing_sequence_accuracy",
+        "topk_sequence_accuracy",
+    ):
+        if metrics.get(key) is not None:
+            saved_metrics[key] = _json_safe(metrics[key])
+
+    results_to_save = {
+        "test_file": test_file_path,
+        "checkpoint_path": checkpoint_path,
+        "enabled_features": sorted(enabled_features),
+        "metrics": saved_metrics,
+        "grouped_metrics": _json_safe(results["grouped_metrics"]),
+        "inference_time": float(results["inference_time"]),
+    }
+    if "parallel_world_size" in results:
+        results_to_save["parallel_world_size"] = int(results["parallel_world_size"])
+
+    results_path = os.path.join(config.SAVE_DIR, "test_results_ar.json")
+    with open(results_path, "w") as f:
+        json.dump(results_to_save, f, indent=2)
+    logger.info(f"\nResults saved to: {results_path}")
+
+    examples_path = os.path.join(config.SAVE_DIR, "test_examples_ar.json")
+    with open(examples_path, "w") as f:
+        json.dump(_json_safe(metrics["examples"]), f, indent=2)
+    logger.info(f"Examples saved to: {examples_path}")
+
+
+def _resolve_parallel_world_size(requested_world_size=None):
+    if not torch.cuda.is_available():
+        raise RuntimeError("--parallel_eval requires CUDA")
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus <= 1:
+        raise RuntimeError("--parallel_eval requires at least 2 visible CUDA devices")
+    world_size = requested_world_size or visible_gpus
+    if world_size <= 0:
+        raise ValueError("--eval_world_size must be positive")
+    if world_size > visible_gpus:
+        raise ValueError(
+            f"--eval_world_size={world_size} exceeds visible CUDA devices ({visible_gpus})"
+        )
+    return world_size
+
+
+def _parallel_eval_worker(rank, world_size, worker_args, shard_output_dir):
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    logger.info(f"Starting evaluation worker {rank + 1}/{world_size} on {device}")
+
+    requested_features = parse_features(worker_args["features"])
+    config = load_training_config(worker_args["config_path"], logger=logger)
+    tokenizer = prepare_tokenizer(config, logger)
+    model = load_model(
+        config,
+        tokenizer,
+        worker_args["checkpoint_path"],
+        device=device,
+        use_data_parallel=False,
+    )
+    model_module = get_model_module(model)
+    final_enabled_features = resolve_enabled_features(requested_features, model_module)
+
+    test_file_path = worker_args["test_file"] or config.TEST_FILE
+    test_loader = build_test_dataloader(
+        config,
+        tokenizer,
+        test_file=test_file_path,
+        enabled_features=final_enabled_features,
+        shard_index=rank,
+        num_shards=world_size,
+    )
+    results = evaluate_autoregressive_generation(
+        model,
+        test_loader,
+        config,
+        tokenizer,
+        enabled_features=final_enabled_features,
+    )
+    results["enabled_features"] = sorted(final_enabled_features)
+    results["test_file"] = test_file_path
+    results["checkpoint_path"] = worker_args["checkpoint_path"]
+    results["shard_index"] = rank
+    results["num_shards"] = world_size
+
+    shard_path = os.path.join(shard_output_dir, f"shard_{rank}.json")
+    with open(shard_path, "w") as f:
+        json.dump(_json_safe(results), f, indent=2)
+    logger.info(f"Worker {rank + 1}/{world_size} wrote shard results to {shard_path}")
+
+
+def run_parallel_evaluation(args, config, checkpoint_path):
+    world_size = _resolve_parallel_world_size(args.eval_world_size)
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    shard_output_dir = os.path.join(config.SAVE_DIR, "eval_shards", run_id)
+    os.makedirs(shard_output_dir, exist_ok=True)
+    logger.info(
+        f"Running true multi-GPU evaluation with {world_size} workers. "
+        f"Shard outputs: {shard_output_dir}"
+    )
+
+    worker_args = {
+        "config_path": args.config_path,
+        "checkpoint_path": checkpoint_path,
+        "test_file": args.test_file,
+        "features": args.features,
+    }
+    mp.spawn(
+        _parallel_eval_worker,
+        args=(world_size, worker_args, shard_output_dir),
+        nprocs=world_size,
+        join=True,
+    )
+
+    shard_results = []
+    for rank in range(world_size):
+        shard_path = os.path.join(shard_output_dir, f"shard_{rank}.json")
+        with open(shard_path, "r") as f:
+            shard_results.append(json.load(f))
+
+    merged = merge_evaluation_results(shard_results)
+    merged["parallel_world_size"] = world_size
+    final_enabled_features = set(shard_results[0]["enabled_features"])
+    test_file_path = shard_results[0]["test_file"]
+    return merged, final_enabled_features, test_file_path
+
+
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
@@ -992,16 +1154,19 @@ def main():
         epilog="""
 Examples:
   # Test with C-NMR + Formula
-  python src/test.py --ckpt_path model.ckpt --features c_nmr,formula
+  python src/test.py --config_path configs/config.yaml --ckpt_path model.ckpt --features c_nmr,formula
   
   # Test with H-NMR only
-  python src/test.py --ckpt_path model.ckpt --features h_nmr
+  python src/test.py --config_path configs/config.yaml --ckpt_path model.ckpt --features h_nmr
   
   # Test with all features (based on model configuration)
-  python src/test.py --ckpt_path model.ckpt
+  python src/test.py --config_path configs/config.yaml --ckpt_path model.ckpt
   
   # Test with specific test file and features
-  python src/test.py --ckpt_path model.ckpt --test_file test.pkl.lz4 --features c_nmr,formula
+  python src/test.py --config_path configs/config.yaml --ckpt_path model.ckpt --test_file test.pkl.lz4 --features c_nmr,formula
+
+  # True multi-GPU evaluation over sharded test-set samples
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python src/test.py --parallel_eval --config_path configs/config.yaml --ckpt_path model.ckpt --features c_nmr,formula
         """
     )
     parser.add_argument(
@@ -1015,8 +1180,16 @@ Examples:
         type=str,
         default=None,
         help="Path to test dataset file (.pkl.lz4). "
-             "If not provided, uses config.TEST_FILE (which can be set in config_local.py). "
+             "If not provided, uses config.TEST_FILE from YAML/config_local.py. "
              "Example: --test_file /path/to/test.pkl.lz4"
+    )
+    parser.add_argument(
+        "--config_path",
+        "--config-path",
+        dest="config_path",
+        type=str,
+        default=None,
+        help="Optional single YAML config path. If not provided, uses TrainingConfig/config_local.py.",
     )
     parser.add_argument(
         "--features",
@@ -1026,6 +1199,19 @@ Examples:
              "At least one NMR feature (c_nmr or h_nmr) must be specified. "
              "Example: --features c_nmr,formula or --features h_nmr,c_nmr. "
              "If not specified, uses all features based on model configuration."
+    )
+    parser.add_argument(
+        "--parallel_eval",
+        "--parallel-eval",
+        action="store_true",
+        help="Run true multi-GPU evaluation by sharding the test set across one process per GPU.",
+    )
+    parser.add_argument(
+        "--eval_world_size",
+        "--eval-world-size",
+        type=int,
+        default=None,
+        help="Number of visible CUDA devices to use with --parallel_eval. Defaults to all visible devices.",
     )
     args = parser.parse_args()
     
@@ -1039,7 +1225,7 @@ Examples:
         logger.info("No features specified, will use model configuration")
     
     # Load config and tokenizer
-    config = TrainingConfig()
+    config = load_training_config(args.config_path, logger=logger)
     tokenizer = prepare_tokenizer(config, logger)
     
     # Determine checkpoint path
@@ -1048,11 +1234,22 @@ Examples:
         raise ValueError(
             "Checkpoint path not specified. Use:\n"
             "  1. Command line: --ckpt_path <path>\n"
-            "  2. config_local.py: TEST_CKPT_PATH = '<path>'"
+            "  2. configs/config.yaml or config_local.py: TEST_CKPT_PATH = '<path>'"
         )
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    if args.parallel_eval:
+        results, final_enabled_features, test_file_path = run_parallel_evaluation(
+            args,
+            config,
+            checkpoint_path,
+        )
+        print_results(results, enabled_features=final_enabled_features)
+        save_results(config, results, test_file_path, checkpoint_path, final_enabled_features)
+        logger.info("\n===== Test Evaluation Complete =====")
+        return
     
     # Load model
     model = load_model(config, tokenizer, checkpoint_path)
@@ -1066,43 +1263,11 @@ Examples:
     logger.info(f"  - H-NMR encoder: {'Enabled' if model_module.h_encoder is not None else 'Disabled'}")
     logger.info(f"  - Formula encoder: {'Enabled' if model_module.formula_encoder is not None else 'Disabled'}")
     
-    # Determine final enabled features
-    # If user specified features, validate against model configuration
-    # If not specified, use model configuration
-    final_enabled_features = enabled_features
-    if final_enabled_features is None:
-        # Auto-detect from model configuration
-        final_enabled_features = set()
-        if model_module.c_encoder is not None:
-            final_enabled_features.add('c_nmr')
-        if model_module.h_encoder is not None:
-            final_enabled_features.add('h_nmr')
-        if model_module.formula_encoder is not None:
-            final_enabled_features.add('formula')
+    # Determine final enabled features.
+    final_enabled_features = resolve_enabled_features(enabled_features, model_module)
+    if enabled_features is None:
         logger.info(f"Auto-detected features from model: {final_enabled_features}")
     else:
-        # Validate user-specified features against model
-        if 'c_nmr' in final_enabled_features and model_module.c_encoder is None:
-            raise ValueError(
-                "Feature 'c_nmr' is requested but model does not have c_encoder. "
-                "Please check your checkpoint or use different features."
-            )
-        if 'h_nmr' in final_enabled_features and model_module.h_encoder is None:
-            raise ValueError(
-                "Feature 'h_nmr' is requested but model does not have h_encoder. "
-                "Please check your checkpoint or use different features."
-            )
-        if 'formula' in final_enabled_features and model_module.formula_encoder is None:
-            raise ValueError(
-                "Feature 'formula' is requested but model does not have formula_encoder. "
-                "Please check your checkpoint or use different features."
-            )
-        # Ensure at least one NMR feature is enabled
-        if not ('c_nmr' in final_enabled_features or 'h_nmr' in final_enabled_features):
-            raise ValueError(
-                "At least one NMR feature (c_nmr or h_nmr) must be enabled. "
-                f"Specified features: {final_enabled_features}"
-            )
         logger.info(f"Using user-specified features: {final_enabled_features}")
     
     # Build test dataloader
@@ -1132,38 +1297,7 @@ Examples:
     
     # Print results
     print_results(results, enabled_features=final_enabled_features)
-    
-    # Save results
-    os.makedirs(config.SAVE_DIR, exist_ok=True)
-    
-    # Save metrics (convert tensors to Python types)
-    metrics = results["metrics"]
-    results_to_save = {
-        "test_file": test_file_path,  # Test dataset path
-        "checkpoint_path": checkpoint_path,  # Model checkpoint path
-        "enabled_features": list(final_enabled_features),  # Features used for evaluation
-        "metrics": {
-            "token_accuracy": float(metrics["token_accuracy"]),
-            "sequence_accuracy": float(metrics["sequence_accuracy"]),
-            "valid_smiles_ratio": float(metrics["valid_smiles_ratio"]),
-            "tanimoto_similarity": float(metrics["tanimoto_similarity"]) if metrics.get("tanimoto_similarity") is not None else None,
-            "similarity_samples": int(metrics.get("similarity_samples", 0)),
-            "total_samples": int(metrics["total_samples"]),
-        },
-        "grouped_metrics": results["grouped_metrics"],
-        "inference_time": float(results["inference_time"])
-    }
-    
-    results_path = os.path.join(config.SAVE_DIR, "test_results_ar.json")
-    with open(results_path, "w") as f:
-        json.dump(results_to_save, f, indent=2)
-    logger.info(f"\nResults saved to: {results_path}")
-    
-    # Save examples
-    examples_path = os.path.join(config.SAVE_DIR, "test_examples_ar.json")
-    with open(examples_path, "w") as f:
-        json.dump(metrics["examples"], f, indent=2)
-    logger.info(f"Examples saved to: {examples_path}")
+    save_results(config, results, test_file_path, checkpoint_path, final_enabled_features)
     
     logger.info("\n===== Test Evaluation Complete =====")
 

@@ -4,8 +4,14 @@ checkpoints/
 __pycache__/
 *.pyc
 .vscode/
+.sii/
 swanlog/
 logs/
+lightning_logs/
+models/
+.venv/
+.ruff_cache/
+.pytest_cache/
 
 # Local configuration files (user-specific)
 src/config_local.py
@@ -13,6 +19,8 @@ config_local.py
 
 # Logs
 *.log
+*.out
+*.pid
 
 # Python cache
 *.py[cod]
@@ -22,6 +30,16 @@ config_local.py
 dist/
 build/
 *.egg-info/
+
+# Large local datasets and model artifacts
+cache/
+*.ckpt
+*.safetensors
+*.bin
+*.msgpack
+*.h5
+*.ot
+*.onnx
 
 # macOS system files
 .DS_Store
