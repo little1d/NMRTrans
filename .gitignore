@@ -32,7 +32,8 @@ build/
 *.egg-info/
 
 # Large local datasets and model artifacts
-cache/
+cache/*
+!cache/README.md
 *.ckpt
 *.safetensors
 *.bin

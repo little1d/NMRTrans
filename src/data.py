@@ -19,7 +19,8 @@ class MergedDataset(Dataset):
     Expected data format:
     - Each item should have: 'id', 'smiles', 'tokenized_input', 'atom_count', 'molecular_formula' (optional)
     - 'tokenized_input' is a JSON string that parses to a dict with:
-        * "1HNMR": list of peaks, each peak is [chem_shift, peakwidth_str, split_str, integral_str, list_of_floats]
+        * "1HNMR": list of peaks, each peak is
+          [chem_shift, shift_half_range, split_str, integral_str, list_of_floats]
         * "13CNMR": list of float values (same format as original c_nmr_peaks)
     """
 
@@ -107,7 +108,9 @@ class MergedDataset(Dataset):
         
         Returns:
             tuple: (h_nmr_peaks, c_nmr_peaks)
-                h_nmr_peaks: list of list, each inner list has 5 elements [chem_shift, peakwidth_str, split_str, integral_str, j_coupling_list]
+                h_nmr_peaks: list of list, each inner list has 5 elements
+                    [chem_shift, shift_half_range, split_str, integral_str,
+                     j_coupling_list]
                 c_nmr_peaks: list of float values
         """
         try:
@@ -115,7 +118,8 @@ class MergedDataset(Dataset):
             
             h_nmr_peaks = []
             if "1HNMR" in tokenized_input and isinstance(tokenized_input["1HNMR"], list):
-                # 保留所有5个特征，但peakwidth不再使用
+                # Preserve all five raw fields. Numeric feature conversion,
+                # including peak width, is performed in features.py.
                 h_nmr_peaks = tokenized_input["1HNMR"]
             
             c_nmr_peaks = []

@@ -240,7 +240,8 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
     """
     Specialized Set Transformer Encoder for 1HNMR peaks with 5 features:
     1. chemical_shift (numeric, ppm)
-    2. peak_width     (numeric, ppm)  ← NEW: width/range of complex peaks
+    2. peak_width     (numeric, ppm; reported chemical-shift half-range,
+                       not the physical full width at half maximum)
     3. split_pattern  (discrete token, embedded)
     4. integral       (numeric, H count)
     5. J-coupling     (6 numeric values, padded)
@@ -318,7 +319,8 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
     
     def forward(self, peaks, mask=None):
         """
-        peaks: (B, L, 10) - 1HNMR features [chem_shift, width, split_idx, integral, j1-j6]
+        peaks: (B, L, 10) - 1HNMR features
+            [chem_shift, shift_half_range, split_idx, integral, j1-j6]
         mask:  (B, L)     - 1=valid peak, 0=padding
         Returns: 
             X: (B, L, d_model) - per-peak encoded features
@@ -339,7 +341,7 @@ class SetTransformer1HNMRPeakEncoder(nn.Module):
         
         # ✅ UPDATED: Separate 10-dim features
         chem_shift = peaks[..., 0:1]    # (B, L, 1) - index 0
-        peak_width = peaks[..., 1:2]    # (B, L, 1) - index 1 ← NEW
+        peak_width = peaks[..., 1:2]    # (B, L, 1) - chemical-shift half-range
         split_idx = peaks[..., 2].long()  # (B, L)   - index 2 (was 1)
         integral = peaks[..., 3:4]      # (B, L, 1) - index 3 (was 2)
         j_coupling = peaks[..., 4:10]   # (B, L, 6) - indices 4-9 (was 3-8)
