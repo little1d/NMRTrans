@@ -69,7 +69,8 @@ huggingface-cli download little1d/C-H-Formula nmrtrans-c-h-nmr-formula.ckpt --lo
 python src/test.py \
   --config_path configs/local.yaml \
   --ckpt_path checkpoints/pretrained/nmrtrans-c-h-nmr-formula.ckpt \
-  --features c_nmr,h_nmr,formula
+  --features c_nmr,h_nmr,formula \
+  --output_dir checkpoints/eval_c_h_formula
 ```
 
 Other released checkpoints can be downloaded in the same way by substituting the Hugging Face repository and checkpoint filename:
@@ -91,27 +92,33 @@ huggingface-cli download <repo_id> <checkpoint_file> --local-dir checkpoints/pre
 python src/test.py \
   --config_path configs/local.yaml \
   --ckpt_path checkpoints/pretrained/<checkpoint_file> \
-  --features <feature_list>
+  --features <feature_list> \
+  --output_dir checkpoints/<evaluation_name>
 ```
 
 Make sure `configs/local.yaml` points to the corresponding data/cache paths before running evaluation on the released test split.
 
 ## 📊 Results
 
-The table reports greedy top-1 autoregressive decoding on the released test split. Epochs refer to the selected validation-best checkpoints used for release.
+The table reports greedy top-1 autoregressive decoding on the released
+21,298-sample test split. Sequence accuracy compares the generated and target
+molecules after RDKit SMILES canonicalization, matching the validation metric;
+equivalent SMILES serializations therefore count as correct. Epochs refer to
+the selected validation-best checkpoints used for release.
 
 | Input features | Epoch | Sequence acc. | Token acc. | Tanimoto similarity |
 | --- | ---: | ---: | ---: | ---: |
-| C-NMR | 8529 | 0.0427 | 0.3816 | 0.3296 |
-| H-NMR | 7469 | 0.1994 | 0.5647 | 0.5516 |
-| C-NMR + H-NMR | 7469 | 0.3646 | 0.6824 | 0.6997 |
-| C-NMR + Formula | 8189 | 0.1813 | 0.5062 | 0.5153 |
-| H-NMR + Formula | 9589 | 0.3719 | 0.6673 | 0.6902 |
-| C-NMR + H-NMR + Formula | 5409 | 0.4447 | 0.7229 | 0.7569 |
+| C-NMR | 8529 | 0.0406 | 0.3816 | 0.3296 |
+| H-NMR | 7469 | 0.1913 | 0.5647 | 0.5516 |
+| C-NMR + H-NMR | 7469 | 0.3513 | 0.6823 | 0.6997 |
+| C-NMR + Formula | 8189 | 0.1791 | 0.5062 | 0.5153 |
+| H-NMR + Formula | 9589 | 0.3582 | 0.6673 | 0.6902 |
+| C-NMR + H-NMR + Formula | 5409 | 0.4230 | 0.7201 | 0.7531 |
 
 > **Notes**
 > - All metrics are computed under greedy top-1 autoregressive decoding.
 > - These numbers may differ slightly from those reported in the paper because they were re-evaluated with the refactored codebase and released checkpoints.
+> - Full metrics, including top-3/5/10 sequence accuracy, are available under `results/release_v1/`.
 
 ## 🏋️ Training
 

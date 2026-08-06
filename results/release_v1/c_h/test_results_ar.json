@@ -1,0 +1,62 @@
+{
+  "test_file": "playground/archive_before_nmrexp_merge_20260801/cache/test.pkl.lz4",
+  "checkpoint_path": "checkpoints/release_checkpoints/nmrtrans-c-h-nmr.ckpt",
+  "enabled_features": [
+    "c_nmr",
+    "h_nmr"
+  ],
+  "metrics": {
+    "token_accuracy": 0.6823032302934988,
+    "sequence_accuracy": 0.35125363883932764,
+    "valid_smiles_ratio": 0.9244530002817166,
+    "tanimoto_similarity": 0.6997095700211374,
+    "similarity_samples": 19535,
+    "total_samples": 21298,
+    "teacher_forcing_token_accuracy": 0.9605807091130182,
+    "teacher_forcing_sequence_accuracy": 0.36414808703111606,
+    "topk_sequence_accuracy": {
+      "3": 0.45013616302000187,
+      "5": 0.4834256737721852,
+      "10": 0.5111278054277397
+    }
+  },
+  "grouped_metrics": {
+    "all": {
+      "sample_count": 21298,
+      "token_acc": 0.6823032302934988,
+      "seq_acc": 0.35125363883932764,
+      "valid_ratio": 0.9244530002817166,
+      "similarity": 0.6997074940738615
+    },
+    "short_0-20": {
+      "sample_count": 1112,
+      "token_acc": 0.7409792795924725,
+      "seq_acc": 0.46492805755395683,
+      "valid_ratio": 0.9703237410071942,
+      "similarity": 0.7150510678941312
+    },
+    "medium_20-40": {
+      "sample_count": 11323,
+      "token_acc": 0.7058662456488015,
+      "seq_acc": 0.39168065000441576,
+      "valid_ratio": 0.9420648238099444,
+      "similarity": 0.7058664094623022
+    },
+    "long_40-60": {
+      "sample_count": 7542,
+      "token_acc": 0.6526637190443646,
+      "seq_acc": 0.29872712808273666,
+      "valid_ratio": 0.9040042429063909,
+      "similarity": 0.691697942772295
+    },
+    "very_long_>60": {
+      "sample_count": 1321,
+      "token_acc": 0.6001604628085774,
+      "seq_acc": 0.20893262679788038,
+      "valid_ratio": 0.8516275548826646,
+      "similarity": 0.6744735826227451
+    }
+  },
+  "inference_time": 104.26032662391663,
+  "parallel_world_size": 4
+}

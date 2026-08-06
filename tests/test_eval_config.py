@@ -3,7 +3,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from src.config import PROJECT_ROOT
-from src.test import merge_evaluation_results, parse_features, resolve_enabled_features, shard_indices
+from src.test import (
+    calculate_sequence_accuracy,
+    merge_evaluation_results,
+    parse_features,
+    resolve_enabled_features,
+    shard_indices,
+)
 
 
 class EvaluationConfigTests(unittest.TestCase):
@@ -53,6 +59,11 @@ class EvaluationConfigTests(unittest.TestCase):
 
         self.assertFalse(any(deprecated_api in source for source in sources))
 
+    def test_sequence_accuracy_uses_canonical_smiles(self):
+        self.assertEqual(calculate_sequence_accuracy("CCO", "OCC"), 1.0)
+        self.assertEqual(calculate_sequence_accuracy("CCO", "CCN"), 0.0)
+        self.assertEqual(calculate_sequence_accuracy("CCO", "not-smiles"), 0.0)
+
     def test_shard_indices_split_dataset_by_rank(self):
         self.assertEqual(shard_indices(total_size=10, num_shards=3, shard_index=0), [0, 3, 6, 9])
         self.assertEqual(shard_indices(total_size=10, num_shards=3, shard_index=1), [1, 4, 7])
@@ -63,7 +74,7 @@ class EvaluationConfigTests(unittest.TestCase):
             {
                 "metrics": {
                     "token_accuracy": 0.5,
-                    "sequence_accuracy": 0.25,
+                    "sequence_accuracy": 0.5,
                     "valid_smiles_ratio": 0.75,
                     "tanimoto_similarity": 0.2,
                     "similarity_samples": 2,
@@ -71,13 +82,13 @@ class EvaluationConfigTests(unittest.TestCase):
                     "examples": [{"rank": 0}],
                     "teacher_forcing_token_accuracy": 0.4,
                     "teacher_forcing_sequence_accuracy": 0.1,
-                    "topk_sequence_accuracy": {3: 0.5, 5: 0.75},
+                    "topk_sequence_accuracy": {3: 0.75, 5: 1.0},
                 },
                 "grouped_metrics": {
                     "short_0-20": {
                         "sample_count": 4,
                         "token_acc": 0.5,
-                        "seq_acc": 0.25,
+                        "seq_acc": 0.5,
                         "valid_ratio": 0.75,
                         "similarity": 0.2,
                     }
@@ -87,7 +98,7 @@ class EvaluationConfigTests(unittest.TestCase):
             {
                 "metrics": {
                     "token_accuracy": 1.0,
-                    "sequence_accuracy": 0.5,
+                    "sequence_accuracy": 1.0,
                     "valid_smiles_ratio": 0.25,
                     "tanimoto_similarity": 0.8,
                     "similarity_samples": 6,
@@ -101,7 +112,7 @@ class EvaluationConfigTests(unittest.TestCase):
                     "short_0-20": {
                         "sample_count": 6,
                         "token_acc": 1.0,
-                        "seq_acc": 0.5,
+                        "seq_acc": 1.0,
                         "valid_ratio": 0.25,
                         "similarity": 0.8,
                     }
@@ -112,7 +123,7 @@ class EvaluationConfigTests(unittest.TestCase):
 
         metrics = merged["metrics"]
         self.assertAlmostEqual(metrics["token_accuracy"], 0.8)
-        self.assertAlmostEqual(metrics["sequence_accuracy"], 0.4)
+        self.assertAlmostEqual(metrics["sequence_accuracy"], 0.8)
         self.assertAlmostEqual(metrics["valid_smiles_ratio"], 0.45)
         self.assertAlmostEqual(metrics["tanimoto_similarity"], 0.65)
         self.assertEqual(metrics["similarity_samples"], 8)
@@ -120,9 +131,10 @@ class EvaluationConfigTests(unittest.TestCase):
         self.assertEqual(metrics["examples"], [{"rank": 0}, {"rank": 1}])
         self.assertAlmostEqual(metrics["teacher_forcing_token_accuracy"], 0.64)
         self.assertAlmostEqual(metrics["teacher_forcing_sequence_accuracy"], 0.22)
-        self.assertAlmostEqual(metrics["topk_sequence_accuracy"][3], 0.8)
-        self.assertAlmostEqual(metrics["topk_sequence_accuracy"][5], 0.9)
+        self.assertAlmostEqual(metrics["topk_sequence_accuracy"][3], 0.9)
+        self.assertAlmostEqual(metrics["topk_sequence_accuracy"][5], 1.0)
         self.assertAlmostEqual(merged["grouped_metrics"]["short_0-20"]["token_acc"], 0.8)
+        self.assertAlmostEqual(merged["grouped_metrics"]["short_0-20"]["seq_acc"], 0.8)
         self.assertEqual(merged["grouped_metrics"]["short_0-20"]["sample_count"], 10)
         self.assertEqual(merged["inference_time"], 9.0)
 

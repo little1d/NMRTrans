@@ -156,6 +156,30 @@ def calculate_smiles_similarity(smiles1: str, smiles2: str) -> float:
         # Catch any other exceptions
         return -1.0
 
+
+def calculate_sequence_accuracy(smiles1: str, smiles2: str) -> float:
+    """Return sequence accuracy after RDKit molecular canonicalization.
+
+    This matches the validation metric: two different SMILES serializations
+    receive full credit when they describe the same molecule.
+    """
+    if not RDKit_AVAILABLE:
+        return 0.0
+
+    clean_smiles1 = re.sub(r'<bos>|<eos>|<pad>|<mask>', '', smiles1).strip()
+    clean_smiles2 = re.sub(r'<bos>|<eos>|<pad>|<mask>', '', smiles2).strip()
+    if not clean_smiles1 or not clean_smiles2:
+        return 0.0
+
+    try:
+        mol1 = Chem.MolFromSmiles(clean_smiles1, sanitize=True)
+        mol2 = Chem.MolFromSmiles(clean_smiles2, sanitize=True)
+        if mol1 is None or mol2 is None:
+            return 0.0
+        return float(Chem.MolToSmiles(mol1) == Chem.MolToSmiles(mol2))
+    except Exception:
+        return 0.0
+
 def shard_indices(total_size: int, num_shards: int, shard_index: int):
     """Return deterministic round-robin indices for one evaluation shard."""
     if num_shards <= 0:
@@ -491,15 +515,6 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
     example_count = 0
     max_examples = 100
     
-    def _clean_content_tokens(tokens: torch.Tensor, cfg):
-        """去掉 PAD/BOS/EOS，只保留有效内容token。"""
-        mask = (
-            (tokens != cfg.PAD_TOKEN_ID) &
-            (tokens != cfg.BOS_TOKEN_ID) &
-            (tokens != cfg.EOS_TOKEN_ID)
-        )
-        return tokens[mask]
-    
     # Create progress bar with total number of batches
     total_batches = len(test_loader)
     pbar = tqdm(test_loader, desc="Evaluating", total=total_batches, 
@@ -625,26 +640,27 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     else:
                         token_acc = torch.tensor(0.0)
                     
-                    # Sequence accuracy: exact match requires same length AND all tokens match
-                    if true_content_len == gen_content_len and true_content_len > 0:
-                        seq_acc = (true_content == gen_content).all().item()
-                    else:
-                        seq_acc = 0.0
-                    
                     # SMILES validity
                     is_valid = is_valid_smiles(gen_smiles)
+
+                    # Sequence accuracy follows validation: compare molecules
+                    # after RDKit canonicalization, not raw SMILES strings.
+                    seq_acc = calculate_sequence_accuracy(
+                        true_smiles,
+                        gen_smiles,
+                    )
                     
                     # Calculate Tanimoto similarity with ground truth
                     similarity = calculate_smiles_similarity(true_smiles, gen_smiles)
                     
-                    # ===== Beam search top-k 序列准确率（精确匹配内容token）=====
-                    true_content = _clean_content_tokens(true_tokens, config)
+                    # Top-k sequence accuracy uses the same canonicalized
+                    # molecular comparison as greedy sequence accuracy.
                     for k in beam_sizes:
                         candidates = beam_tokens[:k]  # (k, seq_len)
                         hit = False
                         for cand in candidates:
-                            cand_content = _clean_content_tokens(cand, config)
-                            if cand_content.shape[0] == true_content.shape[0] and torch.equal(cand_content, true_content):
+                            cand_smiles = model_module.tokens_to_smiles(cand)
+                            if calculate_sequence_accuracy(true_smiles, cand_smiles):
                                 hit = True
                                 break
                         if hit:
@@ -759,11 +775,10 @@ def print_results(results, enabled_features=None):
     # Print overall results
     metrics = results["metrics"]
     logger.info(f"\n--- Overall Results ---")
-    logger.info(f"  Token Accuracy: {metrics['token_accuracy']:.4f}")
     logger.info(f"  Sequence Accuracy: {metrics['sequence_accuracy']:.4f}")
+    logger.info(f"  Token Accuracy: {metrics['token_accuracy']:.4f}")
     logger.info(f"  Valid SMILES Ratio: {metrics['valid_smiles_ratio']:.4f}")
-    if metrics.get('tanimoto_similarity') is not None:
-        logger.info(f"  Tanimoto Similarity: {metrics['tanimoto_similarity']:.4f} (n={metrics['similarity_samples']})")
+    logger.info(f"  Tanimoto Similarity: {metrics['tanimoto_similarity']:.4f} (n={metrics['similarity_samples']})" if metrics.get('tanimoto_similarity') is not None else "  Tanimoto Similarity: N/A")
     if metrics.get("teacher_forcing_token_accuracy") is not None:
         logger.info(f"  TF Token Accuracy (teacher forcing): {metrics['teacher_forcing_token_accuracy']:.4f}")
     if metrics.get("teacher_forcing_sequence_accuracy") is not None:
@@ -774,7 +789,7 @@ def print_results(results, enabled_features=None):
             key=lambda item: int(item[0]),
         )
         topk_str = ", ".join([f"top{k}: {value:.4f}" for k, value in topk_items])
-        logger.info(f"  Beam Search Seq Acc ({topk_str})")
+        logger.info(f"  Beam Search Sequence Accuracy ({topk_str})")
     logger.info(f"  Total Samples: {metrics['total_samples']}")
     
     # Print grouped metrics
@@ -783,8 +798,8 @@ def print_results(results, enabled_features=None):
         if group_name == "all":
             continue
         logger.info(f"\n  {group_name} (n={group_metrics['sample_count']}):")
-        logger.info(f"    Token Acc: {group_metrics['token_acc']:.4f}")
         logger.info(f"    Seq Acc: {group_metrics['seq_acc']:.4f}")
+        logger.info(f"    Token Acc: {group_metrics['token_acc']:.4f}")
         logger.info(f"    Valid Ratio: {group_metrics['valid_ratio']:.4f}")
         if 'similarity' in group_metrics:
             logger.info(f"    Tanimoto Similarity: {group_metrics['similarity']:.4f}")
@@ -1201,6 +1216,13 @@ Examples:
              "If not specified, uses all features based on model configuration."
     )
     parser.add_argument(
+        "--output_dir",
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for merged evaluation results. Defaults to SAVE_DIR from YAML.",
+    )
+    parser.add_argument(
         "--parallel_eval",
         "--parallel-eval",
         action="store_true",
@@ -1226,6 +1248,8 @@ Examples:
     
     # Load config and tokenizer
     config = load_training_config(args.config_path, logger=logger)
+    if args.output_dir:
+        config.SAVE_DIR = os.path.abspath(args.output_dir)
     tokenizer = prepare_tokenizer(config, logger)
     
     # Determine checkpoint path
