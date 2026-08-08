@@ -5,57 +5,57 @@
     "h_nmr"
   ],
   "metrics": {
-    "token_accuracy": 0.5647265933834822,
-    "sequence_accuracy": 0.1912855667198798,
-    "valid_smiles_ratio": 0.9158606441919429,
-    "tanimoto_similarity": 0.5516075052587557,
-    "similarity_samples": 19318,
+    "token_accuracy": 0.576799157174672,
+    "sequence_accuracy": 0.20565311296835384,
+    "valid_smiles_ratio": 0.9244999530472345,
+    "tanimoto_similarity": 0.5617189960452568,
+    "similarity_samples": 19690,
     "total_samples": 21298,
-    "teacher_forcing_token_accuracy": 0.9406609680131276,
-    "teacher_forcing_sequence_accuracy": 0.19949187246128244,
+    "teacher_forcing_token_accuracy": 0.9434332659799964,
+    "teacher_forcing_sequence_accuracy": 0.21536483882813448,
     "topk_sequence_accuracy": {
-      "3": 0.27791341910038503,
-      "5": 0.3118133158043009,
-      "10": 0.3461827401633956
+      "3": 0.2943468870316462,
+      "5": 0.3264156258803644,
+      "10": 0.35895389238426145
     }
   },
   "grouped_metrics": {
     "all": {
       "sample_count": 21298,
-      "token_acc": 0.5647265933834822,
-      "seq_acc": 0.1912855667198798,
-      "valid_ratio": 0.9158606441919429,
-      "similarity": 0.5516041891126215
+      "token_acc": 0.576799157174672,
+      "seq_acc": 0.20565311296835384,
+      "valid_ratio": 0.9244999530472345,
+      "similarity": 0.5617105598031202
     },
     "short_0-20": {
       "sample_count": 1112,
-      "token_acc": 0.609265093359989,
-      "seq_acc": 0.2526978417266187,
-      "valid_ratio": 0.9757194244604317,
-      "similarity": 0.5286205659201689
+      "token_acc": 0.6175308328443508,
+      "seq_acc": 0.2670863309352518,
+      "valid_ratio": 0.9775179856115108,
+      "similarity": 0.5446979471255048
     },
     "medium_20-40": {
       "sample_count": 11323,
-      "token_acc": 0.5780802587300387,
-      "seq_acc": 0.21354764638346727,
-      "valid_ratio": 0.9350878742382761,
-      "similarity": 0.5445417525087627
+      "token_acc": 0.590246858786399,
+      "seq_acc": 0.230592599134505,
+      "valid_ratio": 0.9395036651064206,
+      "similarity": 0.5567606875047699
     },
     "long_40-60": {
       "sample_count": 7542,
-      "token_acc": 0.5455117771543762,
-      "seq_acc": 0.16282153274993372,
-      "valid_ratio": 0.8907451604348979,
-      "similarity": 0.5620650671273985
+      "token_acc": 0.5586930439626939,
+      "seq_acc": 0.1758154335719968,
+      "valid_ratio": 0.9033412887828163,
+      "similarity": 0.5694545700321645
     },
     "very_long_>60": {
       "sample_count": 1321,
-      "token_acc": 0.5224766155689345,
-      "seq_acc": 0.11127933383800151,
-      "valid_ratio": 0.8440575321725965,
-      "similarity": 0.5790322345502796
+      "token_acc": 0.5306177469933466,
+      "seq_acc": 0.1105223315669947,
+      "valid_ratio": 0.8720666161998486,
+      "similarity": 0.5777833453704009
     }
   },
-  "inference_time": 90.44829082489014,
+  "inference_time": 91.33229517936707,
   "parallel_world_size": 4
 }

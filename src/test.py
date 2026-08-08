@@ -597,7 +597,10 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     beam_tokens = beam_generated_ids[i]
                     
                     # Convert to SMILES strings
-                    true_smiles = model_module.tokens_to_smiles(true_tokens)
+                    # Use the original dataset SMILES as the molecular reference,
+                    # exactly as validation does. Decoding the target token IDs can
+                    # introduce <unk> for molecules outside the legacy vocabulary.
+                    reference_smiles = original_smiles_list[i]
                     gen_smiles = model_module.tokens_to_smiles(gen_tokens)
                     
                     # Calculate true length (excluding special tokens)
@@ -646,12 +649,12 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                     # Sequence accuracy follows validation: compare molecules
                     # after RDKit canonicalization, not raw SMILES strings.
                     seq_acc = calculate_sequence_accuracy(
-                        true_smiles,
+                        reference_smiles,
                         gen_smiles,
                     )
                     
                     # Calculate Tanimoto similarity with ground truth
-                    similarity = calculate_smiles_similarity(true_smiles, gen_smiles)
+                    similarity = calculate_smiles_similarity(reference_smiles, gen_smiles)
                     
                     # Top-k sequence accuracy uses the same canonicalized
                     # molecular comparison as greedy sequence accuracy.
@@ -660,7 +663,7 @@ def evaluate_autoregressive_generation(model, test_loader, config, tokenizer, en
                         hit = False
                         for cand in candidates:
                             cand_smiles = model_module.tokens_to_smiles(cand)
-                            if calculate_sequence_accuracy(true_smiles, cand_smiles):
+                            if calculate_sequence_accuracy(reference_smiles, cand_smiles):
                                 hit = True
                                 break
                         if hit:

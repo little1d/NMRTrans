@@ -67,7 +67,7 @@ mkdir -p checkpoints/pretrained
 huggingface-cli download little1d/C-H-Formula nmrtrans-c-h-nmr-formula.ckpt --local-dir checkpoints/pretrained
 
 python src/test.py \
-  --config_path configs/local.yaml \
+  --config_path configs/experiment_c_h_formula.yaml \
   --ckpt_path checkpoints/pretrained/nmrtrans-c-h-nmr-formula.ckpt \
   --features c_nmr,h_nmr,formula \
   --output_dir checkpoints/eval_c_h_formula
@@ -90,13 +90,14 @@ Template:
 huggingface-cli download <repo_id> <checkpoint_file> --local-dir checkpoints/pretrained
 
 python src/test.py \
-  --config_path configs/local.yaml \
+  --config_path configs/experiment_<feature_combination>.yaml \
   --ckpt_path checkpoints/pretrained/<checkpoint_file> \
   --features <feature_list> \
   --output_dir checkpoints/<evaluation_name>
 ```
 
-Make sure `configs/local.yaml` points to the corresponding data/cache paths before running evaluation on the released test split.
+Use the experiment configuration matching the checkpoint's feature combination,
+and make sure its data/cache paths point to the released test split.
 
 ## 📊 Results
 
@@ -108,12 +109,12 @@ the selected validation-best checkpoints used for release.
 
 | Input features | Epoch | Sequence acc. | Token acc. | Tanimoto similarity |
 | --- | ---: | ---: | ---: | ---: |
-| C-NMR | 8529 | 0.0406 | 0.3816 | 0.3296 |
-| H-NMR | 7469 | 0.1913 | 0.5647 | 0.5516 |
-| C-NMR + H-NMR | 7469 | 0.3513 | 0.6823 | 0.6997 |
-| C-NMR + Formula | 8189 | 0.1791 | 0.5062 | 0.5153 |
-| H-NMR + Formula | 9589 | 0.3582 | 0.6673 | 0.6902 |
-| C-NMR + H-NMR + Formula | 5409 | 0.4230 | 0.7201 | 0.7531 |
+| C-NMR | 8519 | 0.1364 | 0.4835 | 0.4694 |
+| H-NMR | 7459 | 0.2057 | 0.5768 | 0.5617 |
+| C-NMR + H-NMR | 7459 | 0.3497 | 0.6795 | 0.6944 |
+| C-NMR + Formula | 9059 | 0.2551 | 0.5826 | 0.6015 |
+| H-NMR + Formula | 9579 | 0.3590 | 0.6698 | 0.6904 |
+| C-NMR + H-NMR + Formula | 5399 | 0.4337 | 0.7263 | 0.7592 |
 
 > **Notes**
 > - All metrics are computed under greedy top-1 autoregressive decoding.
