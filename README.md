@@ -1,8 +1,9 @@
 <div align="center">
 
-# 🤓 NMRTrans: Structure Elucidation from Experimental NMR Spectra via Set Transformers
+# 🤓 [KDD 2026] NMRTrans: Structure Elucidation from Experimental NMR Spectra via Set Transformers
 
 [![arXiv](https://img.shields.io/badge/arXiv-2602.10158-b31b1b.svg)](https://arxiv.org/abs/2602.10158)
+[![ACM Digital Library](https://img.shields.io/badge/ACM%20Digital%20Library-10.1145%2F3770855.3818935-0085CA?logo=acm&logoColor=white)](https://dl.acm.org/doi/10.1145/3770855.3818935)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Collection-yellow?logo=huggingface)](https://huggingface.co/collections/little1d/nmrtrans)
 [![](https://raw.githubusercontent.com/SwanHubX/assets/main/badge2.svg)](https://swanlab.cn/@Harrison/NMRTrans/overview)
 
@@ -193,14 +194,22 @@ python src/train.py \
 If you use NMRTrans in your research, please cite:
 
 ```bibtex
-@article{yang2026nmrtrans,
-      title={NMRTrans: Structure Elucidation from Experimental NMR Spectra via Set Transformers},
-      author={Liujia Yang* and Zhuo Yang* and Jiaqing Xie* and Yubin Wang* and Ben Gao and Tianfan Fu and Xingjian Wei and Jiaxing Sun and Jiang Wu and Conghui He and Yuqiang Li and Qinying Gu},
-      year={2026},
-      eprint={2602.10158},
-      archivePrefix={arXiv},
-      primaryClass={physics.chem-ph},
-      url={https://arxiv.org/abs/2602.10158},
+@inproceedings{10.1145/3770855.3818935,
+author = {Yang, Liujia and Yang, Zhuo and Xie, Jiaqing and Wang, Yubin and Gao, Ben and Wei, Xingjian and Sun, Jiaxing and Wu, Jiang and He, Conghui and Li, Yuqiang and Gu, Qinying},
+title = {NMRTrans: Structure Elucidation from Experimental NMR Spectra via Set Transformers},
+year = {2026},
+isbn = {9798400722592},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3770855.3818935},
+doi = {10.1145/3770855.3818935},
+abstract = {Nuclear Magnetic Resonance (NMR) spectroscopy is fundamental for molecular structure elucidation, yet interpreting spectra at scale remains time-consuming and highly expertise-dependent. While recent spectrum-as-language modeling and retrieval-based methods have shown promise, they rely heavily on large corpora of computed spectra and exhibit notable performance drops when applied to experimental measurements. To address these issues, we build NMRSpec, a large-scale corpus of experimental 1H and 13C NMR spectra mined from chemical literature, and propose NMRTrans, which models spectra as unordered peak sets and aligns the model's inductive bias with the physical nature of NMR. To the best of our knowledge, NMRTrans is the first NMR Transformer trained solely on large-scale experimental spectra and achieves state-of-the-art performance on experimental benchmarks, improving Top-10 Accuracy over the strongest baseline by +17.82 points (61.15\% versus 43.33\%), and underscoring the importance of experimental data and structure-aware architectures for reliable NMR structure elucidation. Code is released at https://github.com/little1d/NMRTrans.},
+booktitle = {Proceedings of the 32nd ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2},
+pages = {12621–12632},
+numpages = {12},
+keywords = {ai for chemistry, ai for spectra, nuclear magnetic resonance, structure elucidation, spectra-to-smiles, experimental spectra},
+location = {Republic of Korea},
+series = {KDD '26}
 }
 ```
 
